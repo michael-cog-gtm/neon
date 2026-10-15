@@ -336,6 +336,8 @@ WalRedoMain(int argc, char *argv[])
 #if PG_MAJORVERSION_NUM >= 18
 	pgaio_init_backend();
 	smgrinit();
+	/* PG18 no longer creates the backend-local lock table in the shmem init */
+	InitLockManagerAccess();
 #endif
 
 	SetProcessingMode(NormalProcessing);

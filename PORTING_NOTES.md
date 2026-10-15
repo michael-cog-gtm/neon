@@ -65,6 +65,12 @@ buffer-completion callbacks registered). Neon has no local fd for pageserver-bac
   single-user mode all call it). neon_walredo builds its own pseudo-shmem, so every WAL redo request died. That made
   computes reconnect in a tight loop: pgbench hung and the pageserver log grew to 12 GB. `walredoproc.c` now calls
   `InitPostmasterChildSlots()` right after `InitializeMaxBackends()` on PG18, as single-user mode does.
+- PG18 split `InitLocks()` into `LockManagerShmemInit()` (shared) and `InitLockManagerAccess()` (backend-local
+  `LockMethodLocalHash`, called from `BaseInit()`). walredo doesn't run `BaseInit()`, so the local hash stayed NULL.
+  The first redo that extended the visibility map (`visibilitymap_pin` -> `vm_extend` -> `LockRelationForExtension`)
+  segfaulted in `hash_search`, and the pageserver only saw `early eof` on walredo stdout. walredo now calls
+  `InitLockManagerAccess()` after `smgrinit()`. Checked by replaying a saved failing `.walredo` input: exit 0,
+  8192-byte page returned.
 
 ### Logical decoding (neon_rmgr)
 - PG18 renamed `ReorderBufferGetChange`/`ReorderBufferGetTupleBuf` to `ReorderBufferAllocChange`/`ReorderBufferAllocTupleBuf`.
