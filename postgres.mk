@@ -113,6 +113,7 @@ postgres-install-%: postgres-configure-% \
 	$(MAKE) -C $(BUILD_DIR)/$*/contrib/pg_buffercache install
 	$(MAKE) -C $(BUILD_DIR)/$*/contrib/pg_visibility install
 	$(MAKE) -C $(BUILD_DIR)/$*/contrib/pageinspect install
+	if [ -d $(BUILD_DIR)/$*/contrib/pg_walinspect ]; then $(MAKE) -C $(BUILD_DIR)/$*/contrib/pg_walinspect install; fi
 	$(MAKE) -C $(BUILD_DIR)/$*/contrib/pg_trgm install
 	$(MAKE) -C $(BUILD_DIR)/$*/contrib/amcheck install
 	$(MAKE) -C $(BUILD_DIR)/$*/contrib/test_decoding install

@@ -122,44 +122,50 @@ log_newpage_copy(NRelFileInfo * rinfo, ForkNumber forkNum, BlockNumber blkno,
 
 #if PG_MAJORVERSION_NUM >= 17
 /*
- * Wrapper around log_newpages() that makes a temporary copy of the block and
+ * Wrapper around log_newpages() that makes a temporary copy of the blocks and
  * WAL-logs that. This makes it safe to use while holding only a shared lock
  * on the page, see XLogSaveBufferForHint. We don't use XLogSaveBufferForHint
  * directly because it skips the logging if the LSN is new enough.
+ *
+ * Sets the LSN of each original page to the end of the WAL record that
+ * contains its image.
  */
-static XLogRecPtr
+static void
 log_newpages_copy(NRelFileInfo * rinfo, ForkNumber forkNum, BlockNumber blkno,
 				  BlockNumber nblocks, Page *pages, bool page_std)
 {
 	PGIOAlignedBlock copied_buffer[XLR_MAX_BLOCK_ID];
-	BlockNumber	blknos[XLR_MAX_BLOCK_ID];
+	BlockNumber blknos[XLR_MAX_BLOCK_ID];
 	Page		pageptrs[XLR_MAX_BLOCK_ID];
 	int			nregistered = 0;
+	int			batch_start = 0;
 
 	for (int i = 0; i < nblocks; i++)
 	{
-		Page	page = copied_buffer[nregistered].data;
+		Page		page = copied_buffer[nregistered].data;
+
 		memcpy(page, pages[i], BLCKSZ);
 		pageptrs[nregistered] = page;
 		blknos[nregistered] = blkno + i;
 
 		++nregistered;
 
-		if (nregistered >= XLR_MAX_BLOCK_ID)
+		if (nregistered >= XLR_MAX_BLOCK_ID || i == nblocks - 1)
 		{
 			log_newpages(rinfo, forkNum, nregistered, blknos, pageptrs,
 						 page_std);
+
+			/*
+			 * log_newpages() writes at most XLR_MAX_BLOCK_ID pages in one
+			 * record. XactLastRecEnd is the end of that record, which is what
+			 * the page LSN must be (ProcLastRecPtr is its start).
+			 */
+			for (int j = batch_start; j <= i; j++)
+				PageSetLSN(pages[j], XactLastRecEnd);
+			batch_start = i + 1;
 			nregistered = 0;
 		}
 	}
-
-	if (nregistered != 0)
-	{
-		log_newpages(rinfo, forkNum, nregistered, blknos, pageptrs,
-					 page_std);
-	}
-
-	return ProcLastRecPtr;
 }
 #endif /* PG_MAJORVERSION_NUM >= 17 */
 
@@ -208,19 +214,16 @@ neon_wallog_pagev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 	if (log_pages)
 	{
-		XLogRecPtr	recptr;
-		recptr = log_newpages_copy(&InfoFromSMgrRel(reln), forknum, blocknum,
-								   nblocks, (Page *) buffers, false);
-
-		for (int i = 0; i < nblocks; i++)
-			PageSetLSN(unconstify(char *, buffers[i]), recptr);
+		log_newpages_copy(&InfoFromSMgrRel(reln), forknum, blocknum,
+						  nblocks, (Page *) buffers, false);
 
 		ereport(SmgrTrace,
 				(errmsg(NEON_TAG "Page %u through %u of relation %u/%u/%u.%u "
-								 "were force logged, lsn=%X/%X",
+						"were force logged, lsn=%X/%X",
 						blocknum, blocknum + nblocks,
 						RelFileInfoFmt(InfoFromSMgrRel(reln)),
-						forknum, LSN_FORMAT_ARGS(recptr))));
+						forknum,
+						LSN_FORMAT_ARGS(PageGetLSN((Page) buffers[nblocks - 1])))));
 	}
 
 	for (int i = 0; i < nblocks; i++)
