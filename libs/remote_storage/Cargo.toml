@@ -51,6 +51,7 @@ byteorder = "1.4"
 rand.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 camino-tempfile.workspace = true
 test-context.workspace = true
 rand.workspace = true

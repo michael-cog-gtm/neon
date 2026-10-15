@@ -6,36 +6,30 @@ use crate::{
     ConcurrencyLimiter, Download, DownloadError, DownloadOpts, GCS_SCOPES, Listing, ListingMode,
     ListingObject, MAX_KEYS_PER_DELETE_GCS, REMOTE_STORAGE_PREFIX_SEPARATOR, RemotePath,
     RemoteStorage, StorageMetadata, TimeTravelError, TimeoutOrCancel, GCSVersion, VersionId,
-    GCSVersionListing, 
 };
 use anyhow::Context;
-use azure_core::Etag;
 use bytes::Bytes;
-use bytes::BytesMut;
 use chrono::DateTime;
 use futures::stream::Stream;
-use futures::stream::TryStreamExt;
 use futures_util::StreamExt;
-use gcp_auth::{Token, TokenProvider};
-use http::Method;
+use gcp_auth::TokenProvider;
 use http::StatusCode;
 use reqwest::{Client, header};
 use scopeguard::ScopeGuard;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::num::{NonZeroU32, ParseIntError};
-use std::pin::{Pin, pin};
+use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
-use tokio_util::codec::{BytesCodec, FramedRead};
 use tokio_util::sync::CancellationToken;
-use tracing;
-use url::{ParseError, Url};
+use url::Url;
 use utils::backoff;
 use uuid::Uuid;
+
+const GCS_BASE_URL: &str = "https://storage.googleapis.com";
 
 // ---------
 fn to_system_time(timestamp: Option<String>) -> Option<SystemTime> {
@@ -52,12 +46,11 @@ pub struct GCSBucket {
     max_keys_per_list_response: Option<i32>,
     concurrency_limiter: ConcurrencyLimiter,
     pub timeout: Duration,
+    base_url: String,
 }
 
 struct GetObjectRequest {
-    bucket: String,
     key: String,
-    etag: Option<String>,
     range: Option<String>,
 }
 
@@ -100,6 +93,7 @@ impl GCSBucket {
             concurrency_limiter: ConcurrencyLimiter::new(
                 remote_storage_config.concurrency_limit.get(),
             ),
+            base_url: GCS_BASE_URL.to_string(),
         })
     }
 
@@ -133,10 +127,6 @@ impl GCSBucket {
 
     pub fn bucket_name(&self) -> &str {
         &self.bucket_name
-    }
-
-    fn max_keys_per_delete(&self) -> usize {
-        MAX_KEYS_PER_DELETE_GCS
     }
 
     async fn permit(
@@ -209,16 +199,14 @@ impl GCSBucket {
             .unwrap();
         
         let mut versions_base_uri = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o?prefix={}&versions=true",
+            "{}/storage/v1/b/{}/o?prefix={}&versions=true",
+            self.base_url,
             self.bucket_name.clone(),
             list_prefix,
         );
 
         if let ListingMode::WithDelimiter = mode {
-            versions_base_uri.push_str(&format!(
-                "&delimiter={}",
-                REMOTE_STORAGE_PREFIX_SEPARATOR.to_string()
-            ));
+            versions_base_uri.push_str(&format!("&delimiter={REMOTE_STORAGE_PREFIX_SEPARATOR}"));
         }
        
         loop {
@@ -232,7 +220,7 @@ impl GCSBucket {
                 },
             }
             
-            let mut req_uri = versions_base_uri.clone();
+            let _req_uri = versions_base_uri.clone();
 
             let response = backoff::retry(
                 || async {
@@ -334,7 +322,8 @@ impl GCSBucket {
         let started_at = start_measuring_requests(kind);
 
         let multipart_uri = format!(
-            "https://storage.googleapis.com/upload/storage/v1/b/{}/o?uploadType=multipart",
+            "{}/upload/storage/v1/b/{}/o?uploadType=multipart",
+            self.base_url,
             self.bucket_name.clone()
         );
 
@@ -358,7 +347,7 @@ impl GCSBucket {
         let data_part = reqwest::multipart::Part::stream_with_length(stream_body, fs_size as u64)
             .mime_str("application/octet-stream")?;
 
-        let mut form = reqwest::multipart::Form::new()
+        let form = reqwest::multipart::Form::new()
             .part("metadata", metadata_part)
             .part("bodystream", data_part);
 
@@ -394,9 +383,7 @@ impl GCSBucket {
         match res {
             Ok(res) => {
                 if !res.status().is_success() {
-                    match res.status() {
-                        _ => Err(anyhow::anyhow!("GCS PUT error \n\t {:?}", res)),
-                    }
+                    Err(anyhow::anyhow!("GCS PUT error \n\t {:?}", res))
                 } else {
                     let body = res
                         .text()
@@ -406,7 +393,7 @@ impl GCSBucket {
                     let resp: GCSObject = serde_json::from_str(&body)
                         .map_err(|e: serde_json::Error| DownloadError::Other(e.into()))?;
 
-                    if !resp.size.is_some_and(|s| s == fs_size as i64) {
+                    if resp.size.is_none_or(|s| s != fs_size as i64) {
                         // very unlikely
                         return Err(anyhow::anyhow!(
                             "Boundary string from 'multipart/related' HTTP upload occurred in payload"
@@ -436,7 +423,7 @@ impl GCSBucket {
             let mut delete_objects_status = HashMap::new();
 
             let mut form = reqwest::multipart::Form::new();
-            let bulk_uri = "https://storage.googleapis.com/batch/storage/v1";
+            let bulk_uri = format!("{}/batch/storage/v1", self.base_url);
 
             for (index, path) in delete_objects.iter().enumerate() {
                 delete_objects_status.insert(index + 1, path.clone());
@@ -475,7 +462,7 @@ impl GCSBucket {
                 );
                 let part = reqwest::multipart::Part::text(delete_req).headers(part_headers);
 
-                form = form.part(format!("request-{}", index), part);
+                form = form.part(format!("request-{index}"), part);
             }
 
             let mut headers = header::HeaderMap::new();
@@ -488,7 +475,7 @@ impl GCSBucket {
             );
 
             let req = Client::new()
-                .post(bulk_uri)
+                .post(&bulk_uri)
                 .bearer_auth(self.token_provider.token(GCS_SCOPES).await?.as_str())
                 .multipart(form)
                 .headers(headers)
@@ -524,13 +511,13 @@ impl GCSBucket {
             let res_body = resp.text().await?;
 
             let parsed: HashMap<String, String> = res_body
-                .split(&format!("--{}", boundary))
+                .split(&format!("--{boundary}"))
                 .filter_map(|c| {
                     let mut lines = c.lines();
 
                     let id = lines.find_map(|line| {
                         line.strip_prefix("Content-ID:")
-                            .and_then(|suf| suf.split('+').last())
+                            .and_then(|suf| suf.split('+').next_back())
                             .and_then(|suf| suf.split('>').next())
                             .map(|x| x.trim().to_string())
                     });
@@ -560,7 +547,7 @@ impl GCSBucket {
                             y
                         );
                         None
-                    } else if y.chars().next() != Some('2') {
+                    } else if !y.starts_with('2') {
                         id.map(|v| (v, y))
                     } else {
                         None
@@ -602,7 +589,8 @@ impl GCSBucket {
 
         let metadata_uri_mod = "alt=json";
         let download_uri = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}?{}",
+            "{}/storage/v1/b/{}/o/{}?{}",
+            self.base_url,
             self.bucket_name.clone(),
             encoded_path,
             metadata_uri_mod
@@ -682,7 +670,7 @@ impl GCSBucket {
         Ok(res)
     }
 
-    // need a 'bucket', a 'key', and a bytes 'range'.
+    // need a 'key' and a bytes 'range'.
     async fn get_object(
         &self,
         request: GetObjectRequest,
@@ -690,20 +678,21 @@ impl GCSBucket {
     ) -> anyhow::Result<Download, DownloadError> {
         let kind = RequestKind::Get;
 
-        let permit = self.owned_permit(kind, cancel).await?;
+        let _permit = self.owned_permit(kind, cancel).await?;
 
         let started_at = start_measuring_requests(kind);
 
         let encoded_path: String =
             url::form_urlencoded::byte_serialize(request.key.as_bytes()).collect();
 
-        /// We do this in two parts:
-        /// 1. Serialize the metadata of the first request to get Etag, last modified, etc
-        /// 2. We do not .await the second request pass on the pinned stream to the 'get_object'
-        ///    caller
+        // We do this in two parts:
+        // 1. Serialize the metadata of the first request to get Etag, last modified, etc
+        // 2. We do not .await the second request pass on the pinned stream to the 'get_object'
+        //    caller
         let metadata_uri_mod = "alt=json";
         let download_uri = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}?{}",
+            "{}/storage/v1/b/{}/o/{}?{}",
+            self.base_url,
             self.bucket_name.clone(),
             encoded_path,
             metadata_uri_mod
@@ -779,14 +768,15 @@ impl GCSBucket {
             .expect("object did not contain generation number");
         let generation_mod = format!("generation={generation}");
         let stream_uri = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o/{}?{}&{}",
+            "{}/storage/v1/b/{}/o/{}?{}&{}",
+            self.base_url,
             self.bucket_name.clone(),
             encoded_path,
             stream_uri_mod,
             generation_mod,
         );
 
-        let mut req = Client::new()
+        let req = Client::new()
             .get(stream_uri)
             .headers(headers)
             .bearer_auth(
@@ -834,7 +824,7 @@ impl GCSBucket {
             }
         };
 
-        let remaining = self.timeout.saturating_sub(started_at.elapsed());
+        let _remaining = self.timeout.saturating_sub(started_at.elapsed());
 
         let metadata = resp.metadata.map(StorageMetadata);
 
@@ -847,9 +837,11 @@ impl GCSBucket {
 
         // But let data stream pass through
         Ok(Download {
-            download_stream: Box::pin(object_output.bytes_stream().map(|item| {
-                item.map_err(|e: reqwest::Error| std::io::Error::new(std::io::ErrorKind::Other, e))
-            })),
+            download_stream: Box::pin(
+                object_output
+                    .bytes_stream()
+                    .map(|item| item.map_err(std::io::Error::other)),
+            ),
             etag,
             last_modified,
             metadata,
@@ -858,9 +850,9 @@ impl GCSBucket {
     
     async fn copy_object(
         &self, 
-        from: &RemotePath,
+        _from: &RemotePath,
         to: &RemotePath,
-        cancel: &CancellationToken,
+        _cancel: &CancellationToken,
         generation: Option<&String>,
     ) -> anyhow::Result<reqwest::RequestBuilder> {
 
@@ -880,8 +872,9 @@ impl GCSBucket {
             )
             .collect();
        
-       let mut copy_uri = format!(
-           "https://storage.googleapis.com/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}",
+        let mut copy_uri = format!(
+           "{}/storage/v1/b/{}/o/{}/rewriteTo/b/{}/o/{}",
+           self.base_url,
            self.bucket_name.clone(),
            copy_from_path,
            self.bucket_name.clone(),
@@ -933,37 +926,50 @@ impl RemoteStorage for GCSBucket {
         let request_max_keys = self
             .max_keys_per_list_response
             .into_iter()
-            .chain(max_keys.into_iter())
+            .chain(max_keys)
             .min()
             // https://cloud.google.com/storage/docs/json_api/v1/objects/list?hl=en#parameters
             .unwrap_or(1000);
 
-        // We pass URI in to `list_objects_v2` as we'll modify it with `NextPageToken`, hence
-        // `mut`
-        let mut list_uri = format!(
-            "https://storage.googleapis.com/storage/v1/b/{}/o?prefix={}&maxResults={}",
-            self.bucket_name.clone(),
-            list_prefix,
-            request_max_keys,
-        );
-
-        // on ListingMode:
-        // https://github.com/neondatabase/neon/blob/edc11253b65e12a10843711bd88ad277511396d7/libs/remote_storage/src/lib.rs#L158C1-L164C2
-        if let ListingMode::WithDelimiter = mode {
-            list_uri.push_str(&format!(
-                "&delimiter={}",
-                REMOTE_STORAGE_PREFIX_SEPARATOR.to_string()
-            ));
-        }
+        let list_url = Url::parse(&format!(
+            "{}/storage/v1/b/{}/o",
+            self.base_url, self.bucket_name,
+        ))
+        .map(|mut url| {
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("prefix", &list_prefix);
+                query.append_pair("maxResults", &request_max_keys.to_string());
+                if let ListingMode::WithDelimiter = mode {
+                    query.append_pair(
+                        "delimiter",
+                        &REMOTE_STORAGE_PREFIX_SEPARATOR.to_string(),
+                    );
+                }
+            }
+            url
+        });
 
         async_stream::stream! {
+            let list_url = match list_url {
+                Ok(url) => url,
+                Err(e) => {
+                    yield Err(DownloadError::Other(e.into()));
+                    return;
+                },
+            };
 
-            let mut continuation_token = None;
+            let mut continuation_token: Option<String> = None;
 
             'outer: loop {
                 let started_at = start_measuring_requests(kind);
 
-                let request = self.list_objects_v2(list_uri.clone())
+                let mut request_url = list_url.clone();
+                if let Some(token) = &continuation_token {
+                    request_url.query_pairs_mut().append_pair("pageToken", token);
+                }
+
+                let request = self.list_objects_v2(request_url.to_string())
                     .await
                     .map_err(DownloadError::Other)?
                     .send();
@@ -994,6 +1000,28 @@ impl RemoteStorage for GCSBucket {
                         continue 'outer;
                     },
                 };
+
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    let error = anyhow::anyhow!(
+                        "GCS list of bucket {} prefix {} failed with status {}: {}",
+                        self.bucket_name,
+                        list_prefix,
+                        status,
+                        body
+                    );
+                    if status.is_server_error()
+                        || status == StatusCode::TOO_MANY_REQUESTS
+                        || status == StatusCode::REQUEST_TIMEOUT
+                    {
+                        yield Err(DownloadError::Other(error));
+                        continue 'outer;
+                    }
+
+                    yield Err(DownloadError::BadInput(error));
+                    break 'outer;
+                }
 
                 let body = response.text()
                     .await
@@ -1036,23 +1064,18 @@ impl RemoteStorage for GCSBucket {
                    };
                 }
 
-                result.prefixes.extend(prefixes.iter().filter_map(|p| {
-                    Some(
-                        self.gcs_object_to_relative_path(
-                            p.trim_end_matches(REMOTE_STORAGE_PREFIX_SEPARATOR)
-                        ),
+                result.prefixes.extend(prefixes.iter().map(|p| {
+                    self.gcs_object_to_relative_path(
+                        p.trim_end_matches(REMOTE_STORAGE_PREFIX_SEPARATOR)
                     )
                 }));
 
                 yield Ok(result);
 
-                continuation_token = match resp.next_page_token {
-                    Some(token) => {
-                        list_uri = list_uri + "&pageToken=" + &token;
-                        Some(token)
-                    },
-                    None => break
-                }
+                let Some(token) = resp.next_page_token else {
+                    break;
+                };
+                continuation_token = Some(token);
             }
         }
     }
@@ -1128,9 +1151,7 @@ impl RemoteStorage for GCSBucket {
 
         match res {
             Ok(Ok(_put)) => Ok(()),
-            Ok(Err(sdk)) => {
-                Err(sdk.into())
-            }
+            Ok(Err(sdk)) => Err(sdk),
             Err(_timeout) => Err(TimeoutOrCancel::Timeout.into()),
         }
     }
@@ -1146,12 +1167,10 @@ impl RemoteStorage for GCSBucket {
 
         self.get_object(
             GetObjectRequest {
-                bucket: self.bucket_name.clone(),
                 key: self
                     .relative_path_to_gcs_object(from)
                     .trim_start_matches("/")
                     .to_string(),
-                etag: opts.etag.as_ref().map(|e| e.to_string()),
                 range: opts.byte_range_header(),
             },
             cancel,
@@ -1167,7 +1186,7 @@ impl RemoteStorage for GCSBucket {
         let kind = RequestKind::Delete;
         let permit = self.permit(kind, cancel).await?;
 
-        let mut delete_objects: Vec<String> = Vec::with_capacity(paths.len());
+        let _delete_objects: Vec<String> = Vec::with_capacity(paths.len());
 
         let delete_objects: Vec<String> = paths
             .iter()
@@ -1245,11 +1264,11 @@ impl RemoteStorage for GCSBucket {
            let last_vd = versions.last().unwrap();
            let key = self.relative_path_to_gcs_object(key);
            if last_vd.last_modified > done_if_after {
-               /// Case 1: we have a recent object outside of our restore window.
+               // Case 1: we have a recent object outside of our restore window.
                tracing::trace!("Key {key} has version later than done_if_after, skipping");
                continue;
            }
-           /// we get index in the array that we want whether its `v` or `e`
+           // we get index in the array that we want whether its `v` or `e`
            let version_to_restore_to =
                match versions.binary_search_by_key(&timestamp, |tpl| tpl.last_modified) {
                    Ok(v) => v,
@@ -1304,7 +1323,7 @@ impl RemoteStorage for GCSBucket {
                                       &key_path,
                                       cancel,
                                       Some(&source_id),
-                                  ).await.map_err(|e| TimeTravelError::Other(e.into()))?
+                                  ).await.map_err(TimeTravelError::Other)?
                                   .send();
                                   
                                   tokio::select! {
@@ -1447,3 +1466,6 @@ impl GCSListResponse {
         self.prefixes.as_deref().unwrap_or_default()
     }
 }
+
+#[cfg(test)]
+mod tests;
