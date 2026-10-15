@@ -1206,17 +1206,33 @@ impl WalIngest {
         let RawXlogRecord { info, lsn, mut buf } = raw_record;
         let pg_version = modification.tline.pg_version;
 
+        // Since PG17 the checkpoint record carries wal_level. The record layouts are
+        // unchanged in PG18, so the v17 decoders are reused.
         if info == pg_constants::XLOG_PARAMETER_CHANGE {
-            if let CheckPoint::V17(cp) = &mut self.checkpoint {
-                let rec = v17::XlParameterChange::decode(&mut buf);
-                cp.wal_level = rec.wal_level;
-                self.checkpoint_modified = true;
+            let mut wal_level = || v17::XlParameterChange::decode(&mut buf).wal_level;
+            match &mut self.checkpoint {
+                CheckPoint::V17(cp) => {
+                    cp.wal_level = wal_level();
+                    self.checkpoint_modified = true;
+                }
+                CheckPoint::V18(cp) => {
+                    cp.wal_level = wal_level();
+                    self.checkpoint_modified = true;
+                }
+                _ => {}
             }
         } else if info == pg_constants::XLOG_END_OF_RECOVERY {
-            if let CheckPoint::V17(cp) = &mut self.checkpoint {
-                let rec = v17::XlEndOfRecovery::decode(&mut buf);
-                cp.wal_level = rec.wal_level;
-                self.checkpoint_modified = true;
+            let mut wal_level = || v17::XlEndOfRecovery::decode(&mut buf).wal_level;
+            match &mut self.checkpoint {
+                CheckPoint::V17(cp) => {
+                    cp.wal_level = wal_level();
+                    self.checkpoint_modified = true;
+                }
+                CheckPoint::V18(cp) => {
+                    cp.wal_level = wal_level();
+                    self.checkpoint_modified = true;
+                }
+                _ => {}
             }
         }
 

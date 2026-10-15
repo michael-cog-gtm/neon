@@ -406,7 +406,7 @@ impl MetadataRecord {
                     anyhow::bail!("Unknown RMGR {} for Heap decoding", decoded.xl_rmid);
                 }
             }
-            PgMajorVersion::PG17 => {
+            PgMajorVersion::PG17 | PgMajorVersion::PG18 => {
                 if decoded.xl_rmid == pg_constants::RM_HEAP_ID {
                     let info = decoded.xl_info & pg_constants::XLOG_HEAP_OPMASK;
 
@@ -513,7 +513,7 @@ impl MetadataRecord {
         assert_eq!(decoded.xl_rmid, pg_constants::RM_NEON_ID);
 
         match pg_version {
-            PgMajorVersion::PG16 | PgMajorVersion::PG17 => {
+            PgMajorVersion::PG16 | PgMajorVersion::PG17 | PgMajorVersion::PG18 => {
                 let info = decoded.xl_info & pg_constants::XLOG_HEAP_OPMASK;
 
                 match info {
@@ -716,7 +716,7 @@ impl MetadataRecord {
                     return Ok(Some(record));
                 }
             }
-            PgMajorVersion::PG17 => {
+            PgMajorVersion::PG17 | PgMajorVersion::PG18 => {
                 if info == postgres_ffi::v17::bindings::XLOG_DBASE_CREATE_WAL_LOG {
                     tracing::debug!("XLOG_DBASE_CREATE_WAL_LOG: noop");
                 } else if info == postgres_ffi::v17::bindings::XLOG_DBASE_CREATE_FILE_COPY {

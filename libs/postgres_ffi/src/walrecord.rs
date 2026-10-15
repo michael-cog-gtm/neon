@@ -211,6 +211,7 @@ impl DecodedWALRecord {
                 PgMajorVersion::PG15 => info == crate::v15::bindings::XLOG_DBASE_CREATE_FILE_COPY,
                 PgMajorVersion::PG16 => info == crate::v16::bindings::XLOG_DBASE_CREATE_FILE_COPY,
                 PgMajorVersion::PG17 => info == crate::v17::bindings::XLOG_DBASE_CREATE_FILE_COPY,
+                PgMajorVersion::PG18 => info == crate::v18::bindings::XLOG_DBASE_CREATE_FILE_COPY,
             }
         } else {
             false
