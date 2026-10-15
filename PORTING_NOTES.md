@@ -113,7 +113,32 @@ buffer-completion callbacks registered). Neon has no local fd for pageserver-bac
 - `PgMajorVersion::PG18`, `PgVersionId` range, `for_all_postgres_versions!`/dispatch macros, bindgen for v18.
 
 ## Skipped / left for later
-- (in progress)
+- **Real asynchronous I/O.** `neon_startreadv` performs reads synchronously and completes the AIO handle inline.
+  Prefetching still goes through the existing communicator path. `io_method=worker/io_uring` are not exercised against
+  neon smgr.
+- **`debug_compare_local` with foreign unlogged-build pages.** The PG18 fallback in `neon_writev` is disabled when
+  `debug_compare_local` is on, because that mode keeps its own local copies.
+- **Data checksums.** They are disabled on PG18, as on PG14-17. Supporting `data_checksums=on` would need the pageserver
+  to keep checksums valid in reconstructed pages.
+- **Extensions outside `pgxn/`.** The compute image's third-party extensions (`compute/` Dockerfile) were not built for
+  PG18.
+- **Test coverage.** Only the curated suite below was run. The full `test_runner` regression suite and the other
+  `test_pg_regress` parameters (`v2` reldir, `shard_count=4`) have not been run on PG18.
+- **CI.** Nothing has been verified in CI. All results below are local debug builds.
 
 ## Test status
-- (in progress)
+All runs are local `BUILD_TYPE=debug` builds made with `make -j CARGO_BUILD_FLAGS="--features testing"`.
+
+Curated suite (`~/notes/run_suite.sh`):
+`test_neon_cli_basics`, `test_branching_with_pgbench`, `test_pageserver_restart`, `test_createdb`, `test_dropdb`,
+`test_wal_acceptor.py::{test_restarts,test_restart_endpoint,test_restart_endpoint_wal_page_boundary}` and
+`test_pg_regress[v1-None]`. The 3 deselected tests are the other `test_pg_regress` parameters (`v2` and/or `shard_count=4`).
+
+| Suite | PG18 | PG17 |
+|---|---|---|
+| curated (11 tests) | `11 passed, 3 deselected in 1087.81s`, exit 0 | `11 passed, 3 deselected in 817.04s`, exit 0 |
+
+Builds and Rust unit tests (run after the final changes):
+- `make -j8 CARGO_BUILD_FLAGS="--features testing"`: exit 0, and `neon.so` was rebuilt for v14, v15, v16, v17 and v18.
+- `cargo nextest run --features testing -p postgres_ffi -p wal_decoder -p pageserver -p safekeeper`:
+  `340 tests run: 340 passed, 0 skipped`.
