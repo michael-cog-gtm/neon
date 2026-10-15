@@ -1,10 +1,9 @@
 use std::future::Future;
-use std::io::Write as _;
 use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use hyper::header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE, HeaderName};
 use hyper::http::HeaderValue;
 use hyper::{Body, Method, Request, Response};
@@ -158,6 +157,8 @@ impl Drop for RequestCancelled {
 }
 
 /// An [`std::io::Write`] implementation on top of a channel sending [`bytes::Bytes`] chunks.
+/// Writes park the calling blocking thread until the receiver consumes data; do not use this for
+/// responses where untrusted or slow clients can hold the receiver.
 pub struct ChannelWriter {
     buffer: BytesMut,
     pub tx: mpsc::Sender<std::io::Result<Bytes>>,
@@ -275,11 +276,9 @@ pub async fn prometheus_metrics_handler(
 
     let started_at = std::time::Instant::now();
 
-    let (tx, rx) = mpsc::channel(1);
+    let (tx, rx) = mpsc::channel::<std::io::Result<Bytes>>(1);
 
     let body = Body::wrap_stream(ReceiverStream::new(rx));
-
-    let mut writer = ChannelWriter::new(128 * 1024, tx);
 
     let encoder = TextEncoder::new();
 
@@ -290,78 +289,153 @@ pub async fn prometheus_metrics_handler(
         .unwrap();
 
     let span = info_span!("blocking");
-    tokio::task::spawn_blocking(move || {
-        // there are situations where we lose scraped metrics under load, try to gather some clues
-        // since all nodes are queried this, keep the message count low.
-        let spawned_at = std::time::Instant::now();
+    tokio::spawn(
+        async move {
+            // there are situations where we lose scraped metrics under load, try to gather some clues
+            // since all nodes are queried this, keep the message count low.
+            let spawned_at = std::time::Instant::now();
 
-        let _span = span.entered();
+            // HADRON
+            let collected = match tokio::task::spawn_blocking(move || {
+                if use_latest {
+                    // Skip caching the results if we always force metric collection on scrape.
+                    METRICS_COLLECTOR.run_once(!force_metric_collection_on_scrape)
+                } else {
+                    METRICS_COLLECTOR.last_collected()
+                }
+            })
+            .await
+            {
+                Ok(collected) => collected,
+                Err(error) => {
+                    let failed_at = std::time::Instant::now();
+                    tracing::warn!(
+                        after_bytes = 0,
+                        total_ms = (failed_at - started_at).as_millis(),
+                        spawning_ms = (spawned_at - started_at).as_millis(),
+                        collection_ms = (failed_at - spawned_at).as_millis(),
+                        encoding_ms = 0,
+                        "failed to write out /metrics response: {error:?}"
+                    );
+                    let _ = tx.send(Err(std::io::ErrorKind::BrokenPipe.into())).await;
+                    return;
+                }
+            };
 
-        // HADRON
-        let collected = if use_latest {
-            // Skip caching the results if we always force metric collection on scrape.
-            METRICS_COLLECTOR.run_once(!force_metric_collection_on_scrape)
-        } else {
-            METRICS_COLLECTOR.last_collected()
-        };
+            let gathered_at = std::time::Instant::now();
 
-        let gathered_at = std::time::Instant::now();
+            let spawned_in = spawned_at - started_at;
+            let collected_in = gathered_at - spawned_at;
+            let mut next_family = 0;
+            let mut bytes = 0;
+            let mut encoding_time = Duration::ZERO;
 
-        let res = encoder
-            .encode(&collected.metrics, &mut writer)
-            .and_then(|_| writer.flush().map_err(|e| e.into()));
+            while next_family < collected.metrics.len() {
+                let families = collected.clone();
+                let start = next_family;
+                let encode_result = tokio::task::spawn_blocking(move || {
+                    let encode_started_at = std::time::Instant::now();
+                    encode_metrics_chunk(&families.metrics, start, METRICS_CHUNK_SIZE).map(
+                        |(chunk, next_family)| (chunk, next_family, encode_started_at.elapsed()),
+                    )
+                })
+                .await;
 
-        // this instant is not when we finally got the full response sent, sending is done by hyper
-        // in another task.
-        let encoded_at = std::time::Instant::now();
-
-        let spawned_in = spawned_at - started_at;
-        let collected_in = gathered_at - spawned_at;
-        // remove the wait time here in case the tcp connection was clogged
-        let encoded_in = encoded_at - gathered_at - writer.wait_time();
-        let total = encoded_at - started_at;
-
-        // HADRON
-        let staleness_ms = (encoded_at - collected.collected_at).as_millis();
-        METRICS_STALE_MILLIS.set(staleness_ms as i64);
-
-        match res {
-            Ok(()) => {
-                tracing::info!(
-                    bytes = writer.flushed_bytes(),
-                    total_ms = total.as_millis(),
-                    spawning_ms = spawned_in.as_millis(),
-                    collection_ms = collected_in.as_millis(),
-                    encoding_ms = encoded_in.as_millis(),
-                    stalenss_ms = staleness_ms,
-                    "responded /metrics"
-                );
+                let (chunk, next, encode_elapsed) = match encode_result {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => {
+                        let failed_at = std::time::Instant::now();
+                        let encoding_ms = encoding_time.as_millis();
+                        tracing::warn!(
+                            after_bytes = bytes,
+                            total_ms = (failed_at - started_at).as_millis(),
+                            spawning_ms = spawned_in.as_millis(),
+                            collection_ms = collected_in.as_millis(),
+                            encoding_ms,
+                            "failed to write out /metrics response: {error:?}"
+                        );
+                        let _ = tx.send(Err(std::io::ErrorKind::BrokenPipe.into())).await;
+                        return;
+                    }
+                    Err(error) => {
+                        let failed_at = std::time::Instant::now();
+                        let encoding_ms = encoding_time.as_millis();
+                        tracing::warn!(
+                            after_bytes = bytes,
+                            total_ms = (failed_at - started_at).as_millis(),
+                            spawning_ms = spawned_in.as_millis(),
+                            collection_ms = collected_in.as_millis(),
+                            encoding_ms,
+                            "failed to write out /metrics response: {error:?}"
+                        );
+                        let _ = tx.send(Err(std::io::ErrorKind::BrokenPipe.into())).await;
+                        return;
+                    }
+                };
+                encoding_time += encode_elapsed;
+                next_family = next;
+                let chunk_len = chunk.len();
+                if let Err(error) = tx.send(Ok(chunk)).await {
+                    let failed_at = std::time::Instant::now();
+                    let encoding_ms = encoding_time.as_millis();
+                    tracing::warn!(
+                        after_bytes = bytes,
+                        total_ms = (failed_at - started_at).as_millis(),
+                        spawning_ms = spawned_in.as_millis(),
+                        collection_ms = collected_in.as_millis(),
+                        encoding_ms,
+                        "failed to write out /metrics response: {error:?}"
+                    );
+                    return;
+                }
+                bytes += chunk_len;
             }
-            Err(e) => {
-                // there is a chance that this error is not the BrokenPipe we generate in the writer
-                // for "closed connection", but it is highly unlikely.
-                tracing::warn!(
-                    after_bytes = writer.flushed_bytes(),
-                    total_ms = total.as_millis(),
-                    spawning_ms = spawned_in.as_millis(),
-                    collection_ms = collected_in.as_millis(),
-                    encoding_ms = encoded_in.as_millis(),
-                    "failed to write out /metrics response: {e:?}"
-                );
-                // semantics of this error are quite... unclear. we want to error the stream out to
-                // abort the response to somehow notify the client that we failed.
-                //
-                // though, most likely the reason for failure is that the receiver is already gone.
-                drop(
-                    writer
-                        .tx
-                        .blocking_send(Err(std::io::ErrorKind::BrokenPipe.into())),
-                );
-            }
+
+            // This instant is not when the full response is sent; Hyper sends it in another task.
+            let encoded_at = std::time::Instant::now();
+            let total = encoded_at - started_at;
+
+            // HADRON
+            let staleness_ms = (encoded_at - collected.collected_at).as_millis();
+            METRICS_STALE_MILLIS.set(staleness_ms as i64);
+
+            tracing::info!(
+                bytes,
+                total_ms = total.as_millis(),
+                spawning_ms = spawned_in.as_millis(),
+                collection_ms = collected_in.as_millis(),
+                encoding_ms = encoding_time.as_millis(),
+                stalenss_ms = staleness_ms,
+                "responded /metrics"
+            );
         }
-    });
+        .instrument(span),
+    );
 
     Ok(response)
+}
+
+const METRICS_CHUNK_SIZE: usize = 128 * 1024;
+
+fn encode_metrics_chunk(
+    families: &[metrics::proto::MetricFamily],
+    start: usize,
+    chunk_size: usize,
+) -> Result<(Bytes, usize), metrics::Error> {
+    let encoder = TextEncoder::new();
+    let buffer = BytesMut::with_capacity(chunk_size);
+    let mut writer = buffer.writer();
+    let mut next_family = start;
+
+    while next_family < families.len() {
+        encoder.encode(std::slice::from_ref(&families[next_family]), &mut writer)?;
+        next_family += 1;
+        if writer.get_ref().len() >= chunk_size {
+            break;
+        }
+    }
+
+    Ok((writer.into_inner().freeze(), next_family))
 }
 
 /// Generates CPU profiles.
@@ -714,12 +788,36 @@ pub fn check_permission_with(
 #[cfg(test)]
 mod tests {
     use std::future::poll_fn;
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::{IpAddr, SocketAddr, TcpListener};
+    use std::sync::{Arc, Mutex};
 
     use hyper::service::Service;
+    use metrics::{Encoder, IntGaugeVec, TextEncoder, register_int_gauge_vec};
+    use once_cell::sync::Lazy;
     use routerify::RequestServiceBuilder;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpSocket, TcpStream};
+    use tokio::runtime::Builder;
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
+
+    const SCRAPE_STALL_PADDING_SERIES: usize = 180_000;
+    static SCRAPE_STALL_PADDING: Lazy<IntGaugeVec> = Lazy::new(|| {
+        let metric = register_int_gauge_vec!(
+            "zzzz_http_utils_test_scrape_stall_padding",
+            "Padding metric for testing stalled metrics scrapes",
+            &["series"]
+        )
+        .unwrap();
+        for i in 0..SCRAPE_STALL_PADDING_SERIES {
+            let label = format!("{i:020}");
+            metric.with_label_values(&[&label]).set(1);
+        }
+        metric
+    });
+    static METRICS_SCRAPE_TEST_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     #[tokio::test]
     async fn test_request_id_returned() {
@@ -756,5 +854,188 @@ mod tests {
         let header_val = resp.headers().get(&X_REQUEST_ID_HEADER);
 
         assert_ne!(header_val, None, "response header should NOT be empty");
+    }
+
+    #[test]
+    fn metrics_scrape_does_not_hold_blocking_thread_while_body_unread() {
+        let _test_guard = METRICS_SCRAPE_TEST_LOCK.lock().unwrap();
+        let rt = Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let response = rt.block_on(async {
+            let req = Request::builder()
+                .uri("/metrics?use_latest=true")
+                .body(Body::empty())
+                .unwrap();
+            prometheus_metrics_handler(req, false).await.unwrap()
+        });
+        let probe_result = rt.block_on(async {
+            timeout(Duration::from_secs(5), tokio::task::spawn_blocking(|| ())).await
+        });
+        let probe_completed = probe_result.is_ok();
+        let body_contains_metrics = if probe_completed {
+            rt.block_on(async {
+                hyper::body::to_bytes(response.into_body())
+                    .await
+                    .unwrap()
+                    .windows(b"libmetrics_metric_handler_requests_total".len())
+                    .any(|window| window == b"libmetrics_metric_handler_requests_total")
+            })
+        } else {
+            drop(response);
+            false
+        };
+
+        rt.shutdown_timeout(Duration::from_secs(5));
+
+        assert!(
+            probe_completed,
+            "spawn_blocking probe was blocked by the unread metrics body"
+        );
+        assert!(body_contains_metrics, "metrics response body was empty");
+    }
+
+    #[test]
+    fn stalled_metrics_scrapers_do_not_block_other_endpoints() {
+        let _test_guard = METRICS_SCRAPE_TEST_LOCK.lock().unwrap();
+        let rt = Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let (probe_completed, body_complete, body_size, expected_size) = rt.block_on(async {
+            let _padding = &*SCRAPE_STALL_PADDING;
+            let mut expected_payload = Vec::new();
+            TextEncoder::new()
+                .encode(&metrics::gather(), &mut expected_payload)
+                .unwrap();
+            let expected_size = expected_payload.len();
+            println!(
+                "stalled scrape test uses {SCRAPE_STALL_PADDING_SERIES} padding series; \
+                 measured metrics output: {expected_size} bytes"
+            );
+            assert!(
+                expected_size > 12 * 1024 * 1024,
+                "metrics output is too small to stall loopback sockets"
+            );
+
+            let router = make_router()
+                .get("/metrics", |req| {
+                    request_span(req, |req| prometheus_metrics_handler(req, false))
+                })
+                .get("/probe", |req| {
+                    request_span(req, |_| async {
+                        tokio::task::spawn_blocking(|| ()).await.unwrap();
+                        Ok(Response::new(Body::from("ok")))
+                    })
+                })
+                .build()
+                .unwrap();
+            let builder = RequestServiceBuilder::new(router).unwrap();
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = crate::server::Server::new(Arc::new(builder), listener, None).unwrap();
+            let cancel = CancellationToken::new();
+            let server_cancel = cancel.clone();
+            let mut server_task = tokio::spawn(async move { server.serve(server_cancel).await });
+
+            let mut stalled_clients = Vec::new();
+            for _ in 0..8 {
+                let socket = TcpSocket::new_v4().unwrap();
+                socket.set_recv_buffer_size(4096).unwrap();
+                let mut stream = socket.connect(address).await.unwrap();
+                stream
+                    .write_all(
+                        b"GET /metrics?use_latest=true HTTP/1.1\r\n\
+                          Host: x\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                stalled_clients.push(stream);
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let probe_response = timeout(Duration::from_secs(10), async {
+                let mut stream = TcpStream::connect(address).await?;
+                stream
+                    .write_all(b"GET /probe HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    .await?;
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response).await?;
+                Ok::<_, std::io::Error>(response)
+            })
+            .await;
+            let probe_completed = matches!(
+                probe_response,
+                Ok(Ok(response)) if response.starts_with(b"HTTP/1.1 200")
+            );
+
+            if !probe_completed {
+                drop(stalled_clients);
+                cancel.cancel();
+                if timeout(Duration::from_secs(5), &mut server_task)
+                    .await
+                    .is_err()
+                {
+                    server_task.abort();
+                }
+                return (false, false, 0, expected_size);
+            }
+
+            let mut slow_client = stalled_clients.pop().unwrap();
+            let mut slow_response = timeout(Duration::from_secs(30), async {
+                let mut response = Vec::new();
+                slow_client.read_to_end(&mut response).await?;
+                Ok::<_, std::io::Error>(response)
+            })
+            .await;
+            let (body_complete, body_size) = match &mut slow_response {
+                Ok(Ok(response)) => {
+                    let last_series = format!(
+                        "zzzz_http_utils_test_scrape_stall_padding{{series=\"{:020}\"}} 1",
+                        SCRAPE_STALL_PADDING_SERIES - 1
+                    );
+                    (
+                        response.ends_with(b"0\r\n\r\n")
+                            && response.len() >= expected_size
+                            && response
+                                .windows(last_series.len())
+                                .any(|window| window == last_series.as_bytes()),
+                        response.len(),
+                    )
+                }
+                _ => (false, 0),
+            };
+            drop(slow_client);
+            drop(stalled_clients);
+            cancel.cancel();
+            if timeout(Duration::from_secs(5), &mut server_task)
+                .await
+                .is_err()
+            {
+                server_task.abort();
+            }
+
+            (true, body_complete, body_size, expected_size)
+        });
+
+        rt.shutdown_timeout(Duration::from_secs(5));
+
+        assert!(
+            probe_completed,
+            "/probe did not finish while metrics clients were stalled"
+        );
+        assert!(
+            body_complete,
+            "slow scrape did not receive the complete payload ({body_size} bytes; \
+             expected at least {expected_size})"
+        );
     }
 }
