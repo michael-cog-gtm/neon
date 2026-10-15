@@ -1679,6 +1679,35 @@ neon_write(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, const vo
 
 
 #if PG_MAJORVERSION_NUM >= 17
+#if PG_MAJORVERSION_NUM >= 18
+/*
+ * Another backend may evict a shared buffer of a relation that this backend
+ * doesn't know is in phase 1 of an unlogged build (GiST/SP-GiST/GIN). Such
+ * pages have no real LSN yet and live in the builder's local file, which only
+ * exists during the build, so write them there instead of WAL-logging them.
+ */
+static bool
+neon_is_foreign_unlogged_build_page(SMgrRelation reln, ForkNumber forknum,
+									const void **buffers, BlockNumber nblocks)
+{
+	bool		zero_lsn = false;
+
+	if (forknum != MAIN_FORKNUM || debug_compare_local)
+		return false;
+
+	for (BlockNumber i = 0; i < nblocks; i++)
+	{
+		Page		page = (Page) buffers[i];
+
+		/* zero, or GiST's GistBuildLSN placeholder */
+		if (PageGetLSN(page) < FirstNormalUnloggedLSN && !PageIsNew(page))
+			zero_lsn = true;
+	}
+
+	return zero_lsn && mdexists(reln, forknum);
+}
+#endif
+
 static void
 neon_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 			 const void **buffers, BlockNumber nblocks, bool skipFsync)
@@ -1709,6 +1738,13 @@ neon_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blkno,
 				mdwritev(reln, forknum, blkno, buffers, nblocks, skipFsync);
 				return;
 			}
+#if PG_MAJORVERSION_NUM >= 18
+			if (neon_is_foreign_unlogged_build_page(reln, forknum, buffers, nblocks))
+			{
+				mdwritev(reln, forknum, blkno, buffers, nblocks, skipFsync);
+				return;
+			}
+#endif
 			break;
 
 		case RELPERSISTENCE_TEMP:

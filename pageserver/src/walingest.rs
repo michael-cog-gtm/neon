@@ -1022,15 +1022,61 @@ impl WalIngest {
         let segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
         let rpageno = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
 
-        modification.put_slru_wal_record(
-            SlruKind::MultiXactOffsets,
-            segno,
-            rpageno,
-            NeonWalRecord::MultixactOffsetCreate {
-                mid: xlrec.mid,
-                moff: xlrec.moff,
-            },
-        )?;
+        // PG18's RecordNewMultiXact also sets the next multixid's offset to the end of this one's
+        // members, so that readers don't have to wait for the next multixid to be assigned.
+        if modification.tline.pg_version >= PgMajorVersion::PG18 {
+            let mut next_mid = xlrec.mid.wrapping_add(1);
+            if next_mid < pg_constants::FIRST_MULTIXACT_ID {
+                next_mid = pg_constants::FIRST_MULTIXACT_ID;
+            }
+            let mut next_moff = xlrec.moff.wrapping_add(xlrec.nmembers);
+            if next_moff == 0 {
+                next_moff = 1;
+            }
+            let next_pageno = next_mid / pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
+            if next_pageno == pageno {
+                // Only one record per key and LSN, so set both entries with a single record.
+                modification.put_slru_wal_record(
+                    SlruKind::MultiXactOffsets,
+                    segno,
+                    rpageno,
+                    NeonWalRecord::MultixactOffsetCreateWithNext {
+                        mid: xlrec.mid,
+                        moff: xlrec.moff,
+                        next_moff,
+                    },
+                )?;
+            } else {
+                modification.put_slru_wal_record(
+                    SlruKind::MultiXactOffsets,
+                    segno,
+                    rpageno,
+                    NeonWalRecord::MultixactOffsetCreate {
+                        mid: xlrec.mid,
+                        moff: xlrec.moff,
+                    },
+                )?;
+                modification.put_slru_wal_record(
+                    SlruKind::MultiXactOffsets,
+                    next_pageno / pg_constants::SLRU_PAGES_PER_SEGMENT,
+                    next_pageno % pg_constants::SLRU_PAGES_PER_SEGMENT,
+                    NeonWalRecord::MultixactOffsetCreate {
+                        mid: next_mid,
+                        moff: next_moff,
+                    },
+                )?;
+            }
+        } else {
+            modification.put_slru_wal_record(
+                SlruKind::MultiXactOffsets,
+                segno,
+                rpageno,
+                NeonWalRecord::MultixactOffsetCreate {
+                    mid: xlrec.mid,
+                    moff: xlrec.moff,
+                },
+            )?;
+        }
 
         // Create WAL records for the update of each affected multixact-members page
         let mut members = xlrec.members.iter();

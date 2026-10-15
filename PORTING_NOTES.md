@@ -58,6 +58,38 @@ buffer-completion callbacks registered). Neon has no local fd for pageserver-bac
 - `xl_heap_inplace` now carries invalidation messages; neon only needs its block reference, so no decoder change.
 - Heap/neon-rmgr/dbase/XLOG_PARAMETER_CHANGE/END_OF_RECOVERY record layouts are unchanged vs PG17; the v17 decoders are
   reused for PG18.
+- `xl_xact_stats_item` grew from 12 to 16 bytes (`objid` split into `objid_lo`/`objid_hi`). `XlXactParsedRecord::decode`
+  skipped dropped-stats items with a hard-coded 12, so any commit that dropped a relation was mis-parsed. The safekeeper's
+  interpreted-WAL reader panicked (`cannot advance past remaining`), the pageserver's walreceiver kept disconnecting, and
+  getpage requests timed out with `LSN timeout`. `decode` now takes the `PgMajorVersion` and uses 16 bytes on PG18.
+
+### Multixact offsets: next multixid's offset is pre-set
+- The vendored 18.2 `RecordNewMultiXact` also writes the *next* multixid's offset (end of this multixid's members). It
+  extends the offsets SLRU for `multi + 1` up front, so readers no longer have to wait for the next multixid to be
+  assigned. The pageserver's `MultixactOffsetCreate` redo only wrote the multixid's own entry. After pg_regress,
+  `check_restored_datadir_content` found `pg_multixact/offsets/0000` differing in exactly that next entry. On PG18,
+  `ingest_multixact_create` now also sets the offset for `mid + 1`, skipping 0 for both id and offset as PG does. The
+  pageserver allows only one record per key and LSN (a second one is dropped with `written twice at same LSN`). So when
+  both entries are on the same page, it emits a new `NeonWalRecord::MultixactOffsetCreateWithNext { mid, moff, next_moff }`.
+  When they're on different pages, it emits one `MultixactOffsetCreate` per page. The new variant goes before the
+  `cfg(testing)` `Test` variant so the persisted enum tags of non-test builds keep their values. The vendored PG14-17 sources do not have this change, so the record is gated on PG18. The PG18 code says
+  older minors lacked it, so it is a back-patched fix. If it also reaches the PG14-17 branches, bumping those
+  submodules will need the gate widened.
+
+### initdb: data checksums on by default
+- PG18's `initdb` enables data checksums by default. Pages that the pageserver reconstructs don't carry valid checksums,
+  so computes failed with `invalid page in block N of relation ...` once they read a page back from the pageserver.
+  `postgres_initdb` (pageserver/compute initdb) and `wal_craft` now pass `--no-data-checksums` on PG18, which matches
+  the PG14-17 clusters.
+
+### Unlogged index builds vs. buffer eviction by other backends
+- GiST/SP-GiST/GIN builds keep their pages in a local file during phase 1. Those pages are not WAL-logged and have LSN 0
+  (SP-GiST, GIN) or `GistBuildLSN` (1). Only the building backend knows a build is in progress. On PG18, pg_regress hit
+  shared-buffer evictions of such pages by *other* backends. They PANICked with
+  `Page N of relation ... is evicted with zero LSN` (SP-GiST, page id 0xFF82), or failed
+  `Assert(lsn >= WalSegMinSize)` in `neon_set_lwlsn_block_v` (GiST). On PG18, `neon_writev` now checks permanent
+  main-fork pages whose LSN is below `FirstNormalUnloggedLSN`: if the relation's local file exists, the page belongs to
+  another backend's build and is written there.
 
 ### walredo: postmaster child slots
 - PG18 sizes PMSignal shared memory from `MaxLivePostmasterChildren()`, which errors with

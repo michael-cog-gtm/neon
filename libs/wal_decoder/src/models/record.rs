@@ -47,6 +47,12 @@ pub enum NeonWalRecord {
         trunc_byte: usize,
         trunc_offs: usize,
     },
+    /// Set the offsets of a multixact and of the next one, which is on the same page (PG18+).
+    MultixactOffsetCreateWithNext {
+        mid: MultiXactId,
+        moff: MultiXactOffset,
+        next_moff: MultiXactOffset,
+    },
 
     /// A testing record for unit testing purposes. It supports append data to an existing image, or clear it.
     #[cfg(feature = "testing")]
