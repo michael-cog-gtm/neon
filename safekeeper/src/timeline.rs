@@ -943,6 +943,16 @@ impl Timeline {
             bail!(TimelineError::Cancelled(self.ttid));
         }
 
+        #[cfg(feature = "testing")]
+        if block
+            && fail::eval("sk-wal-residence-guard-timeout", |v| {
+                v.as_deref() == Some(self.ttid.timeline_id.to_string().as_str())
+            }) == Some(true)
+        {
+            warn!("failpoint sk-wal-residence-guard-timeout: simulating timeout in {op_label}");
+            anyhow::bail!("timeout while acquiring WalResidentTimeline guard");
+        }
+
         debug!("requesting WalResidentTimeline guard");
         let started_at = Instant::now();
         let status_before = self.mgr_status.get();
