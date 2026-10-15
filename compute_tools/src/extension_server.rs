@@ -133,6 +133,7 @@ fn parse_pg_version(human_version: &str) -> PgMajorVersion {
             "15" => return PG15,
             "16" => return PG16,
             "17" => return PG17,
+            "18" => return PG18,
             _ => {}
         },
         _ => {}

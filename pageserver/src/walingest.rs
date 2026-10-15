@@ -1022,15 +1022,61 @@ impl WalIngest {
         let segno = pageno / pg_constants::SLRU_PAGES_PER_SEGMENT;
         let rpageno = pageno % pg_constants::SLRU_PAGES_PER_SEGMENT;
 
-        modification.put_slru_wal_record(
-            SlruKind::MultiXactOffsets,
-            segno,
-            rpageno,
-            NeonWalRecord::MultixactOffsetCreate {
-                mid: xlrec.mid,
-                moff: xlrec.moff,
-            },
-        )?;
+        // PG18's RecordNewMultiXact also sets the next multixid's offset to the end of this one's
+        // members, so that readers don't have to wait for the next multixid to be assigned.
+        if modification.tline.pg_version >= PgMajorVersion::PG18 {
+            let mut next_mid = xlrec.mid.wrapping_add(1);
+            if next_mid < pg_constants::FIRST_MULTIXACT_ID {
+                next_mid = pg_constants::FIRST_MULTIXACT_ID;
+            }
+            let mut next_moff = xlrec.moff.wrapping_add(xlrec.nmembers);
+            if next_moff == 0 {
+                next_moff = 1;
+            }
+            let next_pageno = next_mid / pg_constants::MULTIXACT_OFFSETS_PER_PAGE as u32;
+            if next_pageno == pageno {
+                // Only one record per key and LSN, so set both entries with a single record.
+                modification.put_slru_wal_record(
+                    SlruKind::MultiXactOffsets,
+                    segno,
+                    rpageno,
+                    NeonWalRecord::MultixactOffsetCreateWithNext {
+                        mid: xlrec.mid,
+                        moff: xlrec.moff,
+                        next_moff,
+                    },
+                )?;
+            } else {
+                modification.put_slru_wal_record(
+                    SlruKind::MultiXactOffsets,
+                    segno,
+                    rpageno,
+                    NeonWalRecord::MultixactOffsetCreate {
+                        mid: xlrec.mid,
+                        moff: xlrec.moff,
+                    },
+                )?;
+                modification.put_slru_wal_record(
+                    SlruKind::MultiXactOffsets,
+                    next_pageno / pg_constants::SLRU_PAGES_PER_SEGMENT,
+                    next_pageno % pg_constants::SLRU_PAGES_PER_SEGMENT,
+                    NeonWalRecord::MultixactOffsetCreate {
+                        mid: next_mid,
+                        moff: next_moff,
+                    },
+                )?;
+            }
+        } else {
+            modification.put_slru_wal_record(
+                SlruKind::MultiXactOffsets,
+                segno,
+                rpageno,
+                NeonWalRecord::MultixactOffsetCreate {
+                    mid: xlrec.mid,
+                    moff: xlrec.moff,
+                },
+            )?;
+        }
 
         // Create WAL records for the update of each affected multixact-members page
         let mut members = xlrec.members.iter();
@@ -1206,17 +1252,33 @@ impl WalIngest {
         let RawXlogRecord { info, lsn, mut buf } = raw_record;
         let pg_version = modification.tline.pg_version;
 
+        // Since PG17 the checkpoint record carries wal_level. The record layouts are
+        // unchanged in PG18, so the v17 decoders are reused.
         if info == pg_constants::XLOG_PARAMETER_CHANGE {
-            if let CheckPoint::V17(cp) = &mut self.checkpoint {
-                let rec = v17::XlParameterChange::decode(&mut buf);
-                cp.wal_level = rec.wal_level;
-                self.checkpoint_modified = true;
+            let mut wal_level = || v17::XlParameterChange::decode(&mut buf).wal_level;
+            match &mut self.checkpoint {
+                CheckPoint::V17(cp) => {
+                    cp.wal_level = wal_level();
+                    self.checkpoint_modified = true;
+                }
+                CheckPoint::V18(cp) => {
+                    cp.wal_level = wal_level();
+                    self.checkpoint_modified = true;
+                }
+                _ => {}
             }
         } else if info == pg_constants::XLOG_END_OF_RECOVERY {
-            if let CheckPoint::V17(cp) = &mut self.checkpoint {
-                let rec = v17::XlEndOfRecovery::decode(&mut buf);
-                cp.wal_level = rec.wal_level;
-                self.checkpoint_modified = true;
+            let mut wal_level = || v17::XlEndOfRecovery::decode(&mut buf).wal_level;
+            match &mut self.checkpoint {
+                CheckPoint::V17(cp) => {
+                    cp.wal_level = wal_level();
+                    self.checkpoint_modified = true;
+                }
+                CheckPoint::V18(cp) => {
+                    cp.wal_level = wal_level();
+                    self.checkpoint_modified = true;
+                }
+                _ => {}
             }
         }
 

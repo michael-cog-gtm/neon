@@ -62,6 +62,7 @@ macro_rules! for_all_postgres_versions {
         $macro!(v15);
         $macro!(v16);
         $macro!(v17);
+        $macro!(v18);
     };
 }
 
@@ -97,6 +98,7 @@ macro_rules! dispatch_pgversion {
                 $crate::PgMajorVersion::PG15 => v15,
                 $crate::PgMajorVersion::PG16 => v16,
                 $crate::PgMajorVersion::PG17 => v17,
+                $crate::PgMajorVersion::PG18 => v18,
             ]
         )
     };
@@ -129,6 +131,7 @@ macro_rules! enum_pgversion_dispatch {
                 V15 : v15,
                 V16 : v16,
                 V17 : v17,
+                V18 : v18,
             ]
         )
     };
@@ -159,6 +162,7 @@ macro_rules! enum_pgversion {
                 V15 : v15,
                 V16 : v16,
                 V17 : v17,
+                V18 : v18,
             ]
         }
     };
@@ -172,6 +176,7 @@ macro_rules! enum_pgversion {
                 V15 : v15,
                 V16 : v16,
                 V17 : v17,
+                V18 : v18,
             ]
         }
     };
@@ -267,6 +272,25 @@ pub fn generate_wal_segment(
         pg_version,
         pgv::xlog_utils::generate_wal_segment(segno, system_id, lsn)
     )
+}
+
+/// Decodes a `pg_control` file of any supported version into the version-independent
+/// [`ControlFileData`] (the v14 layout). The fields Neon reads from it are laid out the same in
+/// all supported versions, but PG18 added `default_char_signedness`, which moves `crc`, so the
+/// CRC is verified using the layout that matches the file's `pg_control_version`.
+pub fn decode_pg_control(buf: &[u8]) -> anyhow::Result<ControlFileData> {
+    use utils::bin_ser::LeSer;
+    const PG18_CONTROL_VERSION: u32 = 1800;
+
+    let version_bytes = buf
+        .get(8..12)
+        .ok_or_else(|| anyhow::anyhow!("control file is too short"))?;
+    let pg_control_version = u32::from_le_bytes(version_bytes.try_into()?);
+    if pg_control_version < PG18_CONTROL_VERSION {
+        return ControlFileData::decode(buf);
+    }
+    v18::bindings::ControlFileData::decode(buf)?;
+    Ok(ControlFileData::des_prefix(buf)?)
 }
 
 pub fn generate_pg_control(

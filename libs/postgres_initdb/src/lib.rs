@@ -94,6 +94,12 @@ pub async fn do_run_initdb(args: RunInitdbArgs<'_>) -> Result<(), Error> {
         initdb_command.args(["--locale-provider", locale_provider]);
     }
 
+    // Version 18 enables data checksums by default. Pages served by the pageserver don't carry
+    // valid checksums, so keep them disabled as on earlier versions.
+    if pg_version >= PgMajorVersion::PG18 {
+        initdb_command.arg("--no-data-checksums");
+    }
+
     let initdb_proc = initdb_command.spawn().map_err(Error::Spawn)?;
 
     // Ideally we'd select here with the cancellation token, but the problem is that

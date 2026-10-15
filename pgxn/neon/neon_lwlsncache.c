@@ -75,9 +75,19 @@ static XLogRecPtr SetLastWrittenLSNForBlockRangeInternal(XLogRecPtr lsn,
 
 
 /* These hold the set_lwlsn_* hooks which were installed before ours, if any */
+#if PG_MAJORVERSION_NUM < 18
 static set_lwlsn_block_range_hook_type prev_set_lwlsn_block_range_hook = NULL;
 static set_lwlsn_block_v_hook_type prev_set_lwlsn_block_v_hook = NULL;
 static set_lwlsn_block_hook_type prev_set_lwlsn_block_hook = NULL;
+#else
+/*
+ * PG18's Neon fork no longer has block-level set_lwlsn hooks nor a built-in
+ * LastWrittenLsn LWLock: core never calls the block hooks anymore (unlogged
+ * builds go through the smgr unlogged-build hooks), so we own the lock.
+ */
+static LWLock *LastWrittenLsnLockPtr = NULL;
+#define LastWrittenLsnLock LastWrittenLsnLockPtr
+#endif
 static set_max_lwlsn_hook_type prev_set_max_lwlsn_hook = NULL;
 static set_lwlsn_relation_hook_type prev_set_lwlsn_relation_hook = NULL;
 static set_lwlsn_db_hook_type prev_set_lwlsn_db_hook = NULL;
@@ -92,12 +102,14 @@ init_lwlsncache(void)
 	
 	lwlc_register_gucs();
 
+#if PG_MAJORVERSION_NUM < 18
 	prev_set_lwlsn_block_range_hook = set_lwlsn_block_range_hook;
 	set_lwlsn_block_range_hook = neon_set_lwlsn_block_range;
 	prev_set_lwlsn_block_v_hook = set_lwlsn_block_v_hook;
 	set_lwlsn_block_v_hook = neon_set_lwlsn_block_v;
 	prev_set_lwlsn_block_hook = set_lwlsn_block_hook;
 	set_lwlsn_block_hook = neon_set_lwlsn_block;
+#endif
 	prev_set_max_lwlsn_hook = set_max_lwlsn_hook;
 	set_max_lwlsn_hook = neon_set_max_lwlsn;
 	prev_set_lwlsn_relation_hook = set_lwlsn_relation_hook;
@@ -115,6 +127,9 @@ LwLsnCacheShmemRequest(void)
 	requested_size += hash_estimate_size(lwlsn_cache_size, sizeof(LastWrittenLsnCacheEntry));
 
 	RequestAddinShmemSpace(requested_size);
+#if PG_MAJORVERSION_NUM >= 18
+	RequestNamedLWLockTranche("neon_lwlsn", 1);
+#endif
 }
 
 void
@@ -122,6 +137,9 @@ LwLsnCacheShmemInit(void)
 {
 	static HASHCTL info;
 	bool found;
+#if PG_MAJORVERSION_NUM >= 18
+	LastWrittenLsnLockPtr = &GetNamedLWLockTranche("neon_lwlsn")->lock;
+#endif
 	if (lwlsn_cache_size > 0)
 	{
 		info.keysize = sizeof(BufferTag);

@@ -252,8 +252,9 @@ pub struct ControlFile {
 
 impl ControlFile {
     pub(crate) fn new(control_file_buf: Bytes) -> Result<Self, anyhow::Error> {
-        // XXX ControlFileData is version-specific, we're always using v14 here. v17 had changes.
-        let control_file_data = ControlFileData::decode(&control_file_buf)?;
+        // ControlFileData is version-specific; decode_pg_control returns the v14 layout, whose
+        // fields are shared by all versions, after checking the CRC with the file's own layout.
+        let control_file_data = postgres_ffi::decode_pg_control(&control_file_buf)?;
         let control_file = ControlFile {
             control_file_data,
             control_file_buf,
@@ -282,6 +283,7 @@ impl ControlFile {
             202209061 => PgMajorVersion::PG15,
             202307071 => PgMajorVersion::PG16,
             202406281 => PgMajorVersion::PG17,
+            202506291 => PgMajorVersion::PG18,
             catversion => {
                 anyhow::bail!("unrecognized catalog version {catversion}")
             }

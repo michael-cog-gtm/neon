@@ -19,6 +19,7 @@
 #include "access/xlogdefs.h"
 #include "access/xlogreader.h"
 #include "libpq/pqformat.h"
+#include "storage/latch.h"
 #include "storage/fd.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"

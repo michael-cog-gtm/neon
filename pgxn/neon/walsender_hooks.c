@@ -9,6 +9,7 @@
  */
 #include "walsender_hooks.h"
 #include "postgres.h"
+#include "storage/latch.h"
 #include "fmgr.h"
 #include "access/xlogdefs.h"
 #include "replication/walsender.h"
