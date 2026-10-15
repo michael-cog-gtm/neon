@@ -105,7 +105,7 @@ pub struct SnapshotContext {
     pub flush_lsn: Lsn,
     pub wal_seg_size: usize,
     // used to remove WAL hold off in Drop.
-    pub tli: WalResidentTimeline,
+    pub tli: Arc<Timeline>,
 }
 
 impl Drop for SnapshotContext {
@@ -394,10 +394,8 @@ impl WalResidentTimeline {
         }
         shared_state.wal_removal_on_hold = true;
 
-        // Drop shared_state to release the lock, before calling wal_residence_guard().
-        drop(shared_state);
-
-        let tli_copy = self.wal_residence_guard().await?;
+        // Do not await or return an error before creating the context that releases this hold.
+        // Residency is guaranteed by self.
         let from_to_segno = send_segments.then_some(from_segno..=upto_segno);
         let bctx = SnapshotContext {
             from_to_segno,
@@ -405,7 +403,7 @@ impl WalResidentTimeline {
             last_log_term,
             flush_lsn,
             wal_seg_size,
-            tli: tli_copy,
+            tli: self.tli.clone(),
         };
 
         Ok(bctx)
