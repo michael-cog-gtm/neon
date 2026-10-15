@@ -300,6 +300,10 @@ WalRedoMain(int argc, char *argv[])
 	max_parallel_workers = 0;
 	max_wal_senders = 0;
 	InitializeMaxBackends();
+#if PG_MAJORVERSION_NUM >= 18
+	/* PG18 sizes PMSignal shmem from the postmaster child slots */
+	InitPostmasterChildSlots();
+#endif
 
 #if PG_VERSION_NUM >= 150000
 	process_shmem_requests();

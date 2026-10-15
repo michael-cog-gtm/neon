@@ -59,6 +59,13 @@ buffer-completion callbacks registered). Neon has no local fd for pageserver-bac
 - Heap/neon-rmgr/dbase/XLOG_PARAMETER_CHANGE/END_OF_RECOVERY record layouts are unchanged vs PG17; the v17 decoders are
   reused for PG18.
 
+### walredo: postmaster child slots
+- PG18 sizes PMSignal shared memory from `MaxLivePostmasterChildren()`, which errors with
+  `PM child array not initialized yet` unless `InitPostmasterChildSlots()` ran (the postmaster, bootstrap and
+  single-user mode all call it). neon_walredo builds its own pseudo-shmem, so every WAL redo request died. That made
+  computes reconnect in a tight loop: pgbench hung and the pageserver log grew to 12 GB. `walredoproc.c` now calls
+  `InitPostmasterChildSlots()` right after `InitializeMaxBackends()` on PG18, as single-user mode does.
+
 ### Logical decoding (neon_rmgr)
 - PG18 renamed `ReorderBufferGetChange`/`ReorderBufferGetTupleBuf` to `ReorderBufferAllocChange`/`ReorderBufferAllocTupleBuf`.
   `neon_rmgr_decode.c` only compiled its decoder for `== 16` / `== 17`, so on PG18 `neon_rmgr.so` failed to load
