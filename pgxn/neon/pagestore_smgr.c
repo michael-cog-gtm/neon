@@ -135,14 +135,15 @@ log_newpages_copy(NRelFileInfo * rinfo, ForkNumber forkNum, BlockNumber blkno,
 				  BlockNumber nblocks, Page *pages, bool page_std)
 {
 	PGIOAlignedBlock copied_buffer[XLR_MAX_BLOCK_ID];
-	BlockNumber	blknos[XLR_MAX_BLOCK_ID];
+	BlockNumber blknos[XLR_MAX_BLOCK_ID];
 	Page		pageptrs[XLR_MAX_BLOCK_ID];
 	int			nregistered = 0;
 	int			batch_start = 0;
 
 	for (int i = 0; i < nblocks; i++)
 	{
-		Page	page = copied_buffer[nregistered].data;
+		Page		page = copied_buffer[nregistered].data;
+
 		memcpy(page, pages[i], BLCKSZ);
 		pageptrs[nregistered] = page;
 		blknos[nregistered] = blkno + i;
@@ -218,7 +219,7 @@ neon_wallog_pagev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 		ereport(SmgrTrace,
 				(errmsg(NEON_TAG "Page %u through %u of relation %u/%u/%u.%u "
-								 "were force logged, lsn=%X/%X",
+						"were force logged, lsn=%X/%X",
 						blocknum, blocknum + nblocks,
 						RelFileInfoFmt(InfoFromSMgrRel(reln)),
 						forknum,
