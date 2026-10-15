@@ -2,6 +2,7 @@ use std::cmp::min;
 use std::io::{self, ErrorKind};
 use std::ops::RangeInclusive;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
@@ -39,6 +40,57 @@ use crate::timeline::{Timeline, TimelineError, WalResidentTimeline};
 use crate::timelines_global_map::{create_temp_timeline_dir, validate_temp_timeline};
 use crate::wal_storage::{open_wal_file, wal_file_paths};
 use crate::{GlobalTimelines, debug_dump, wal_backup};
+
+/// Bound on a single peer timeline status request (connect + response + body).
+const PEER_STATUS_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(10)
+};
+/// Bound on how long a pull waits for enough peers to report timeline status.
+const WAIT_FOR_PEER_STATUS_DEADLINE: Duration = if cfg!(test) {
+    Duration::from_secs(3)
+} else {
+    Duration::from_secs(60)
+};
+
+enum PeerStatus {
+    Found(Box<TimelineStatus>),
+    NotFound,
+    Failed(String),
+}
+
+async fn fetch_peer_status(
+    http_client: reqwest::Client,
+    host: String,
+    sk_auth_token: Option<SecretString>,
+    tenant_id: utils::id::TenantId,
+    timeline_id: utils::id::TimelineId,
+) -> PeerStatus {
+    let result = tokio::time::timeout(PEER_STATUS_TIMEOUT, async {
+        let cclient = Client::new(http_client, host, sk_auth_token);
+        let resp = cclient.timeline_status(tenant_id, timeline_id).await?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(PeerStatus::NotFound);
+        }
+        let info: TimelineStatus = resp
+            .json()
+            .await
+            .context("Failed to deserialize timeline status")
+            .map_err(|e| mgmt_api::Error::ReceiveErrorBody(e.to_string()))?;
+        Ok(PeerStatus::Found(Box::new(info)))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(status)) => status,
+        Ok(Err(mgmt_api::Error::ApiError(status, _))) if status == StatusCode::NOT_FOUND => {
+            PeerStatus::NotFound
+        }
+        Ok(Err(e)) => PeerStatus::Failed(e.to_string()),
+        Err(_) => PeerStatus::Failed(format!("timed out after {PEER_STATUS_TIMEOUT:?}")),
+    }
+}
 
 /// Stream tar archive of timeline to tx.
 #[instrument(name = "snapshot", skip_all, fields(ttid = %tli.ttid))]
@@ -453,6 +505,14 @@ pub async fn handle_request(
     global_timelines: Arc<GlobalTimelines>,
     wait_for_peer_timeline_status: bool,
 ) -> Result<PullTimelineResponse, ApiError> {
+    let http_hosts = request.http_hosts.clone();
+    if http_hosts.is_empty() {
+        return Err(ApiError::BadRequest(anyhow!(
+            "http_hosts must contain at least one peer"
+        )));
+    }
+    let min_required_successful = http_hosts.len().saturating_sub(1).max(1);
+
     if let Some(mconf) = &request.mconf {
         let sk_id = global_timelines.get_sk_id();
         if !mconf.contains(sk_id) {
@@ -500,29 +560,24 @@ pub async fn handle_request(
         .build()
         .map_err(|e| ApiError::InternalServerError(e.into()))?;
 
-    let http_hosts = request.http_hosts.clone();
-
     // Figure out statuses of potential donors.
     let mut statuses = Vec::new();
     if !wait_for_peer_timeline_status {
-        let responses: Vec<Result<TimelineStatus, mgmt_api::Error>> =
-            futures::future::join_all(http_hosts.iter().map(|url| async {
-                let cclient = Client::new(http_client.clone(), url.clone(), sk_auth_token.clone());
-                let resp = cclient
-                    .timeline_status(request.tenant_id, request.timeline_id)
-                    .await?;
-                let info: TimelineStatus = resp
-                    .json()
-                    .await
-                    .context("Failed to deserialize timeline status")
-                    .map_err(|e| mgmt_api::Error::ReceiveErrorBody(e.to_string()))?;
-                Ok(info)
-            }))
-            .await;
+        let responses = futures::future::join_all(http_hosts.iter().map(|url| {
+            fetch_peer_status(
+                http_client.clone(),
+                url.clone(),
+                sk_auth_token.clone(),
+                request.tenant_id,
+                request.timeline_id,
+            )
+        }))
+        .await;
 
         for (i, response) in responses.into_iter().enumerate() {
             match response {
-                Ok(status) => {
+                PeerStatus::Found(status) => {
+                    let status = *status;
                     if let Some(mconf) = &request.mconf {
                         if status.mconf.generation > mconf.generation {
                             // We probably raced with another timeline membership change with higher generation.
@@ -538,7 +593,13 @@ pub async fn handle_request(
                     }
                     statuses.push((status, i));
                 }
-                Err(e) => {
+                PeerStatus::NotFound => {
+                    info!(
+                        "error fetching status from {}: timeline not found",
+                        http_hosts[i]
+                    );
+                }
+                PeerStatus::Failed(e) => {
                     info!("error fetching status from {}: {e}", http_hosts[i]);
                 }
             }
@@ -547,7 +608,6 @@ pub async fn handle_request(
         // Allow missing responses from up to one safekeeper (say due to downtime)
         // e.g. if we created a timeline on PS A and B, with C being offline. Then B goes
         // offline and C comes online. Then we want a pull on C with A and B as hosts to work.
-        let min_required_successful = (http_hosts.len() - 1).max(1);
         if statuses.len() < min_required_successful {
             return Err(ApiError::InternalServerError(anyhow::anyhow!(
                 "only got {} successful status responses. required: {min_required_successful}",
@@ -555,60 +615,55 @@ pub async fn handle_request(
             )));
         }
     } else {
-        let mut retry = true;
-        // We must get status from all other peers.
-        // Otherwise, we may run into split-brain scenario.
-        while retry {
+        // We tolerate one missing peer, like the non-wait path; the max-term
+        // PreconditionFailed check below still guards donor choice.
+        let deadline = tokio::time::Instant::now() + WAIT_FOR_PEER_STATUS_DEADLINE;
+        loop {
             statuses.clear();
-            retry = false;
-            for (i, url) in http_hosts.iter().enumerate() {
-                let cclient = Client::new(http_client.clone(), url.clone(), sk_auth_token.clone());
-                match cclient
-                    .timeline_status(request.tenant_id, request.timeline_id)
-                    .await
-                {
-                    Ok(resp) => {
-                        if resp.status() == StatusCode::NOT_FOUND {
-                            warn!(
-                                "Timeline {} not found on peer SK {}, no need to pull it",
-                                TenantTimelineId::new(request.tenant_id, request.timeline_id),
-                                url
-                            );
-                            return Ok(PullTimelineResponse {
-                                safekeeper_host: None,
-                            });
-                        }
-                        let info: TimelineStatus = resp
-                            .json()
-                            .await
-                            .context("Failed to deserialize timeline status")
-                            .map_err(ApiError::InternalServerError)?;
-                        statuses.push((info, i));
+            let responses = futures::future::join_all(http_hosts.iter().map(|url| {
+                fetch_peer_status(
+                    http_client.clone(),
+                    url.clone(),
+                    sk_auth_token.clone(),
+                    request.tenant_id,
+                    request.timeline_id,
+                )
+            }))
+            .await;
+
+            for (i, response) in responses.into_iter().enumerate() {
+                match response {
+                    PeerStatus::Found(status) => statuses.push((*status, i)),
+                    PeerStatus::NotFound => {
+                        warn!(
+                            "Timeline {} not found on peer SK {}, no need to pull it",
+                            TenantTimelineId::new(request.tenant_id, request.timeline_id),
+                            http_hosts[i]
+                        );
+                        return Ok(PullTimelineResponse {
+                            safekeeper_host: None,
+                        });
                     }
-                    Err(e) => {
-                        match e {
-                            // If we get a 404, it means the timeline doesn't exist on this safekeeper.
-                            // We can ignore this error.
-                            mgmt_api::Error::ApiError(status, _)
-                                if status == StatusCode::NOT_FOUND =>
-                            {
-                                warn!(
-                                    "Timeline {} not found on peer SK {}, no need to pull it",
-                                    TenantTimelineId::new(request.tenant_id, request.timeline_id),
-                                    url
-                                );
-                                return Ok(PullTimelineResponse {
-                                    safekeeper_host: None,
-                                });
-                            }
-                            _ => {}
-                        }
-                        retry = true;
-                        error!("Failed to get timeline status from {}: {:#}", url, e);
+                    PeerStatus::Failed(e) => {
+                        error!(
+                            "Failed to get timeline status from {}: {:#}",
+                            http_hosts[i], e
+                        );
                     }
                 }
             }
-            sleep(std::time::Duration::from_millis(100)).await;
+
+            if statuses.len() >= min_required_successful {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(ApiError::InternalServerError(anyhow!(
+                    "only got {} successful status responses after {:?}. required: {min_required_successful}",
+                    statuses.len(),
+                    WAIT_FOR_PEER_STATUS_DEADLINE
+                )));
+            }
+            sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -783,4 +838,222 @@ async fn pull_timeline(
     Ok(PullTimelineResponse {
         safekeeper_host: Some(host),
     })
+}
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    use camino_tempfile::Utf8TempDir;
+    use safekeeper_api::membership::Configuration;
+    use safekeeper_api::models::{AcceptorStateStatus, TimelineStatus};
+    use safekeeper_api::{PgVersionId, ServerInfo};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use utils::id::{NodeId, TenantTimelineId};
+
+    use super::handle_request;
+    use crate::wal_backup::WalBackup;
+    use crate::{GlobalTimelines, SafeKeeperConf};
+
+    async fn make_global_timelines() -> (Utf8TempDir, Arc<GlobalTimelines>) {
+        let tempdir = camino_tempfile::tempdir().unwrap();
+        let mut conf = SafeKeeperConf::dummy();
+        conf.workdir = tempdir.path().to_path_buf();
+        conf.my_id = NodeId(1);
+        let conf = Arc::new(conf);
+        let wal_backup = Arc::new(WalBackup::new(&conf).await.unwrap());
+        let global_timelines = Arc::new(GlobalTimelines::new(conf, wal_backup));
+        global_timelines.init().await.unwrap();
+        (tempdir, global_timelines)
+    }
+
+    async fn closed_peer() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    async fn silent_peer() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut sockets = Vec::<TcpStream>::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                sockets.push(socket);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn good_peer(ttid: TenantTimelineId, snapshot_requests: Arc<AtomicUsize>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let snapshot_requests = snapshot_requests.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buf = [0; 1024];
+                        let Ok(read) = stream.read(&mut buf).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..read]);
+                        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+
+                    let request = String::from_utf8_lossy(&request);
+                    let path = request.split_whitespace().nth(1).unwrap_or_default();
+                    let (status, body) = if path.contains("/snapshot/") {
+                        snapshot_requests.fetch_add(1, Ordering::SeqCst);
+                        (
+                            "500 Internal Server Error",
+                            r#"{"msg":"fake peer: no snapshot"}"#.to_string(),
+                        )
+                    } else if path
+                        == format!(
+                            "/v1/tenant/{}/timeline/{}",
+                            ttid.tenant_id, ttid.timeline_id
+                        )
+                    {
+                        let status = TimelineStatus {
+                            tenant_id: ttid.tenant_id,
+                            timeline_id: ttid.timeline_id,
+                            mconf: Configuration::empty(),
+                            acceptor_state: AcceptorStateStatus {
+                                term: 1,
+                                epoch: 1,
+                                term_history: vec![],
+                            },
+                            pg_info: ServerInfo {
+                                pg_version: PgVersionId::UNKNOWN,
+                                system_id: 1,
+                                wal_seg_size: 16 * 1024 * 1024,
+                            },
+                            flush_lsn: 1.into(),
+                            timeline_start_lsn: 1.into(),
+                            local_start_lsn: 1.into(),
+                            commit_lsn: 1.into(),
+                            backup_lsn: 1.into(),
+                            peer_horizon_lsn: 1.into(),
+                            remote_consistent_lsn: 1.into(),
+                            peers: vec![],
+                            walsenders: vec![],
+                            walreceivers: vec![],
+                        };
+                        ("200 OK", serde_json::to_string(&status).unwrap())
+                    } else {
+                        (
+                            "404 Not Found",
+                            r#"{"msg":"fake peer: not found"}"#.to_string(),
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    async fn pull_from_peers(
+        global_timelines: Arc<GlobalTimelines>,
+        ttid: TenantTimelineId,
+        http_hosts: Vec<String>,
+        context: &'static str,
+    ) -> Result<safekeeper_api::models::PullTimelineResponse, http_utils::error::ApiError> {
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            handle_request(
+                safekeeper_api::models::PullTimelineRequest {
+                    tenant_id: ttid.tenant_id,
+                    timeline_id: ttid.timeline_id,
+                    http_hosts,
+                    mconf: None,
+                },
+                None,
+                vec![],
+                global_timelines,
+                true,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("handle_request hung {context}"))
+    }
+
+    #[tokio::test]
+    async fn startup_pull_bounded_with_unresponsive_peers() {
+        let (_tempdir, global_timelines) = make_global_timelines().await;
+        let ttid = TenantTimelineId::generate();
+        let http_hosts = vec![silent_peer().await, closed_peer().await];
+
+        let result = pull_from_peers(
+            global_timelines,
+            ttid,
+            http_hosts,
+            "with unresponsive peers",
+        )
+        .await;
+
+        assert!(result.is_err(), "expected the pull to fail");
+    }
+
+    #[tokio::test]
+    async fn startup_pull_tolerates_silent_peer() {
+        let (_tempdir, global_timelines) = make_global_timelines().await;
+        let ttid = TenantTimelineId::generate();
+        let snapshot_requests = Arc::new(AtomicUsize::new(0));
+        let http_hosts = vec![
+            silent_peer().await,
+            good_peer(ttid, snapshot_requests.clone()).await,
+        ];
+
+        let result =
+            pull_from_peers(global_timelines, ttid, http_hosts, "with a silent peer").await;
+
+        assert!(
+            result.is_err(),
+            "expected the fake snapshot request to fail"
+        );
+        assert!(
+            snapshot_requests.load(Ordering::SeqCst) >= 1,
+            "expected the good peer to receive a snapshot request"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_pull_tolerates_closed_peer() {
+        let (_tempdir, global_timelines) = make_global_timelines().await;
+        let ttid = TenantTimelineId::generate();
+        let snapshot_requests = Arc::new(AtomicUsize::new(0));
+        let http_hosts = vec![
+            closed_peer().await,
+            good_peer(ttid, snapshot_requests.clone()).await,
+        ];
+
+        let result =
+            pull_from_peers(global_timelines, ttid, http_hosts, "with a closed peer").await;
+
+        assert!(
+            result.is_err(),
+            "expected the fake snapshot request to fail"
+        );
+        assert!(
+            snapshot_requests.load(Ordering::SeqCst) >= 1,
+            "expected the good peer to receive a snapshot request"
+        );
+    }
 }
