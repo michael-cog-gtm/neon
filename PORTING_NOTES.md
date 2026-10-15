@@ -59,6 +59,11 @@ buffer-completion callbacks registered). Neon has no local fd for pageserver-bac
 - Heap/neon-rmgr/dbase/XLOG_PARAMETER_CHANGE/END_OF_RECOVERY record layouts are unchanged vs PG17; the v17 decoders are
   reused for PG18.
 
+### Logical decoding (neon_rmgr)
+- PG18 renamed `ReorderBufferGetChange`/`ReorderBufferGetTupleBuf` to `ReorderBufferAllocChange`/`ReorderBufferAllocTupleBuf`.
+  `neon_rmgr_decode.c` only compiled its decoder for `== 16` / `== 17`, so on PG18 `neon_rmgr.so` failed to load
+  (`undefined symbol: neon_rm_decode`). The PG17 decoder is now used for `>= 17`, with aliases for the renamed functions.
+
 ### Rust
 - `PgMajorVersion::PG18`, `PgVersionId` range, `for_all_postgres_versions!`/dispatch macros, bindgen for v18.
 
