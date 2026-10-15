@@ -105,7 +105,7 @@ pub struct SnapshotContext {
     pub flush_lsn: Lsn,
     pub wal_seg_size: usize,
     // used to remove WAL hold off in Drop.
-    pub tli: WalResidentTimeline,
+    pub tli: Arc<Timeline>,
 }
 
 impl Drop for SnapshotContext {
@@ -394,10 +394,8 @@ impl WalResidentTimeline {
         }
         shared_state.wal_removal_on_hold = true;
 
-        // Drop shared_state to release the lock, before calling wal_residence_guard().
-        drop(shared_state);
-
-        let tli_copy = self.wal_residence_guard().await?;
+        // Do not await or return an error before creating the context that releases this hold.
+        // Residency is guaranteed by self.
         let from_to_segno = send_segments.then_some(from_segno..=upto_segno);
         let bctx = SnapshotContext {
             from_to_segno,
@@ -405,7 +403,7 @@ impl WalResidentTimeline {
             last_log_term,
             flush_lsn,
             wal_seg_size,
-            tli: tli_copy,
+            tli: self.tli.clone(),
         };
 
         Ok(bctx)
@@ -783,4 +781,200 @@ async fn pull_timeline(
     Ok(PullTimelineResponse {
         safekeeper_host: Some(host),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        str::FromStr,
+        sync::{Arc, atomic::Ordering},
+        time::Duration,
+    };
+
+    use anyhow::Result;
+    use tokio::{
+        sync::mpsc,
+        time::{sleep, timeout},
+    };
+    use utils::id::{NodeId, TenantTimelineId};
+    use utils::lsn::Lsn;
+
+    use super::stream_snapshot;
+    use crate::{test_utils::Env, timeline::Timeline};
+
+    #[cfg(feature = "testing")]
+    const WAL_RESIDENCE_GUARD_FAILPOINT: &str = "sk-wal-residence-guard-timeout";
+
+    #[cfg(feature = "testing")]
+    struct FailpointGuard;
+
+    #[cfg(feature = "testing")]
+    impl Drop for FailpointGuard {
+        fn drop(&mut self) {
+            fail::remove(WAL_RESIDENCE_GUARD_FAILPOINT);
+        }
+    }
+
+    async fn make_timeline_with_wal() -> Result<(Env, Arc<Timeline>, Lsn)> {
+        const SIZE: usize = 8 * 1024;
+        const MSG_COUNT: usize = 8 * 1024;
+
+        let start_lsn = Lsn::from_str("0/149FD18")?;
+        let env = Env::new(false)?;
+        let tli = env
+            .make_timeline(NodeId(1), TenantTimelineId::generate(), start_lsn)
+            .await?;
+        Env::write_wal(tli.clone(), start_lsn, SIZE, MSG_COUNT, c"neon-file:", None).await?;
+        let flush_lsn = tli.get_flush_lsn().await;
+
+        Ok((env, tli, flush_lsn))
+    }
+
+    async fn set_horizon(tli: &Arc<Timeline>, lsn: Lsn) -> Result<()> {
+        let mut shared_state = tli.write_shared_state().await;
+        {
+            let state = shared_state.sk.state_mut();
+            state.inmem.backup_lsn = lsn;
+            state.inmem.remote_consistent_lsn = lsn;
+        }
+        shared_state.sk.state_mut().flush().await?;
+        Ok(())
+    }
+
+    async fn wait_for_last_removed_segno(
+        tli: &Arc<Timeline>,
+        condition: impl Fn(u64) -> bool,
+        timeout_message: &'static str,
+    ) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let last_removed_segno = tli.last_removed_segno.load(Ordering::Relaxed);
+                if condition(last_removed_segno) {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{timeout_message}"));
+    }
+
+    async fn wait_for_wal_removal_hold_cleared(tli: &Arc<Timeline>, timeout_message: &'static str) {
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if !tli.read_shared_state().await.wal_removal_on_hold {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{timeout_message}"));
+    }
+
+    async fn assert_snapshot_succeeds(tli: Arc<Timeline>) {
+        let (tx, mut rx) = mpsc::channel(1);
+        let snapshot_tli = tli.clone();
+        let snapshot_task = tokio::spawn(async move {
+            stream_snapshot(snapshot_tli, NodeId(1), NodeId(2), tx, None).await;
+        });
+
+        let mut received_bytes = false;
+        while let Some(chunk) = rx.recv().await {
+            let chunk = chunk.unwrap_or_else(|e| panic!("snapshot failed: {e:#}"));
+            received_bytes |= !chunk.is_empty();
+        }
+        snapshot_task.await.unwrap();
+        assert!(received_bytes, "snapshot returned no bytes");
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn test_snapshot_residence_guard_failure_releases_wal_removal_hold() -> Result<()> {
+        let (_env, tli, flush_lsn) = make_timeline_with_wal().await?;
+        let initial_horizon = Lsn(0x3000000);
+        set_horizon(&tli, initial_horizon).await?;
+        wait_for_last_removed_segno(
+            &tli,
+            |last_removed_segno| last_removed_segno == 2,
+            "WAL removal did not reach segment 2 before snapshot",
+        )
+        .await;
+
+        fail::cfg(
+            WAL_RESIDENCE_GUARD_FAILPOINT,
+            &format!("return({})", tli.ttid.timeline_id),
+        )
+        .unwrap();
+        let _failpoint_guard = FailpointGuard;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let snapshot_tli = tli.clone();
+        let snapshot_task = tokio::spawn(async move {
+            stream_snapshot(snapshot_tli, NodeId(1), NodeId(2), tx, None).await;
+        });
+        while rx.recv().await.is_some() {}
+        snapshot_task.await.unwrap();
+        fail::remove(WAL_RESIDENCE_GUARD_FAILPOINT);
+
+        wait_for_wal_removal_hold_cleared(&tli, "wal_removal_on_hold leaked after failed snapshot")
+            .await;
+
+        set_horizon(&tli, flush_lsn).await?;
+        let expected_last_removed_segno = {
+            let shared_state = tli.read_shared_state().await;
+            shared_state
+                .sk
+                .state()
+                .commit_lsn
+                .min(flush_lsn)
+                .segment_number(shared_state.get_wal_seg_size())
+                .saturating_sub(1)
+        };
+        wait_for_last_removed_segno(
+            &tli,
+            |last_removed_segno| last_removed_segno >= expected_last_removed_segno,
+            "WAL removal did not advance after snapshot failure",
+        )
+        .await;
+
+        assert_snapshot_succeeds(tli).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_client_disconnect_releases_wal_removal_hold() -> Result<()> {
+        let (_env, tli, _flush_lsn) = make_timeline_with_wal().await?;
+        set_horizon(&tli, Lsn(0x3000000)).await?;
+        wait_for_last_removed_segno(
+            &tli,
+            |last_removed_segno| last_removed_segno == 2,
+            "WAL removal did not reach segment 2 before snapshot",
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let snapshot_tli = tli.clone();
+        let snapshot_task = tokio::spawn(async move {
+            stream_snapshot(snapshot_tli, NodeId(1), NodeId(2), tx, None).await;
+        });
+        let first_chunk = rx
+            .recv()
+            .await
+            .expect("snapshot ended before sending its first chunk");
+        assert!(
+            first_chunk.is_ok(),
+            "snapshot failed before its first chunk"
+        );
+        drop(rx);
+        snapshot_task.await.unwrap();
+
+        wait_for_wal_removal_hold_cleared(
+            &tli,
+            "wal_removal_on_hold leaked after client disconnect",
+        )
+        .await;
+        assert_snapshot_succeeds(tli).await;
+        Ok(())
+    }
 }
