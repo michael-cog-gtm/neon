@@ -948,33 +948,45 @@ impl RemoteStorage for GCSBucket {
             // https://cloud.google.com/storage/docs/json_api/v1/objects/list?hl=en#parameters
             .unwrap_or(1000);
 
-        // We pass URI in to `list_objects_v2` as we'll modify it with `NextPageToken`, hence
-        // `mut`
-        let mut list_uri = format!(
-            "{}/storage/v1/b/{}/o?prefix={}&maxResults={}",
-            self.base_url,
-            self.bucket_name.clone(),
-            list_prefix,
-            request_max_keys,
-        );
-
-        // on ListingMode:
-        // https://github.com/neondatabase/neon/blob/edc11253b65e12a10843711bd88ad277511396d7/libs/remote_storage/src/lib.rs#L158C1-L164C2
-        if let ListingMode::WithDelimiter = mode {
-            list_uri.push_str(&format!(
-                "&delimiter={}",
-                REMOTE_STORAGE_PREFIX_SEPARATOR.to_string()
-            ));
-        }
+        let list_url = Url::parse(&format!(
+            "{}/storage/v1/b/{}/o",
+            self.base_url, self.bucket_name,
+        ))
+        .map(|mut url| {
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("prefix", &list_prefix);
+                query.append_pair("maxResults", &request_max_keys.to_string());
+                if let ListingMode::WithDelimiter = mode {
+                    query.append_pair(
+                        "delimiter",
+                        &REMOTE_STORAGE_PREFIX_SEPARATOR.to_string(),
+                    );
+                }
+            }
+            url
+        });
 
         async_stream::stream! {
+            let list_url = match list_url {
+                Ok(url) => url,
+                Err(e) => {
+                    yield Err(DownloadError::Other(e.into()));
+                    return;
+                },
+            };
 
-            let mut continuation_token = None;
+            let mut continuation_token: Option<String> = None;
 
             'outer: loop {
                 let started_at = start_measuring_requests(kind);
 
-                let request = self.list_objects_v2(list_uri.clone())
+                let mut request_url = list_url.clone();
+                if let Some(token) = &continuation_token {
+                    request_url.query_pairs_mut().append_pair("pageToken", token);
+                }
+
+                let request = self.list_objects_v2(request_url.to_string())
                     .await
                     .map_err(DownloadError::Other)?
                     .send();
@@ -1005,6 +1017,28 @@ impl RemoteStorage for GCSBucket {
                         continue 'outer;
                     },
                 };
+
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    let error = anyhow::anyhow!(
+                        "GCS list of bucket {} prefix {} failed with status {}: {}",
+                        self.bucket_name,
+                        list_prefix,
+                        status,
+                        body
+                    );
+                    if status.is_server_error()
+                        || status == StatusCode::TOO_MANY_REQUESTS
+                        || status == StatusCode::REQUEST_TIMEOUT
+                    {
+                        yield Err(DownloadError::Other(error));
+                        continue 'outer;
+                    }
+
+                    yield Err(DownloadError::BadInput(error));
+                    break 'outer;
+                }
 
                 let body = response.text()
                     .await
@@ -1057,13 +1091,10 @@ impl RemoteStorage for GCSBucket {
 
                 yield Ok(result);
 
-                continuation_token = match resp.next_page_token {
-                    Some(token) => {
-                        list_uri = list_uri + "&pageToken=" + &token;
-                        Some(token)
-                    },
-                    None => break
-                }
+                let Some(token) = resp.next_page_token else {
+                    break;
+                };
+                continuation_token = Some(token);
             }
         }
     }
@@ -1745,7 +1776,7 @@ mod tests {
             None,
             &cancel,
         );
-        futures::pin_mut!(stream);
+        let mut stream = Box::pin(stream);
         let error = expect_error(
             tokio::time::timeout(Duration::from_secs(30), stream.next())
             .await
@@ -1790,7 +1821,7 @@ mod tests {
             None,
             &cancel,
         );
-        futures::pin_mut!(stream);
+        let mut stream = Box::pin(stream);
         let error = expect_error(
             tokio::time::timeout(Duration::from_secs(30), stream.next())
             .await
@@ -1821,7 +1852,7 @@ mod tests {
             None,
             &cancel,
         );
-        futures::pin_mut!(stream);
+        let mut stream = Box::pin(stream);
         let error = expect_error(
             tokio::time::timeout(Duration::from_secs(30), stream.next())
             .await
