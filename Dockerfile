@@ -172,7 +172,7 @@ COPY --from=build /home/nonroot/pg_install/v17 /usr/local/v17/
 # Deprecated: Old deployment scripts use this tarball which contains all the Postgres binaries.
 # That's obsolete, since all the same files are also present under /usr/local/v*. But to keep the
 # old scripts working for now, create the tarball.
-RUN tar -C /usr/local -cvzf /data/postgres_install.tar.gz v14 v15 v16 v17
+RUN tar -C /usr/local -cvzf /data/postgres_install.tar.gz v14 v15 v16 v17 v18
 
 # By default, pageserver uses `.neon/` working directory in WORKDIR, so create one and fill it with the dummy config.
 # Now, when `docker run ... pageserver` is run, it can start without errors, yet will have some default dummy values.
