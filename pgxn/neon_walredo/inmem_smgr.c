@@ -21,6 +21,7 @@
 #include "../neon/neon_pgversioncompat.h"
 
 #include "access/xlog.h"
+#include "port/pg_iovec.h"
 #include "storage/block.h"
 #include "storage/buf_internals.h"
 #include RELFILEINFO_HDR
@@ -361,8 +362,41 @@ inmem_registersync(SMgrRelation reln, ForkNumber forknum)
 }
 #endif
 
+#if PG_MAJORVERSION_NUM >= 18
+static uint32
+inmem_maxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
+{
+	return PG_IOV_MAX;
+}
+
+static void
+inmem_startreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
+				 BlockNumber blocknum, void **buffers, BlockNumber nblocks)
+{
+	inmem_readv(reln, forknum, blocknum, buffers, nblocks);
+	neon_aio_complete_readv_synchronously(ioh, reln, forknum, blocknum,
+										  buffers, nblocks);
+}
+
+static int
+inmem_fd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
+{
+	elog(ERROR, "inmem_smgr has no file descriptors");
+	return -1;
+}
+
+static bool
+inmem_owns(RelFileLocator rlocator, ProcNumber backend, char relpersistence)
+{
+	return true;
+}
+#endif
+
 static const struct f_smgr inmem_smgr =
 {
+#if PG_MAJORVERSION_NUM >= 18
+	.smgr_name = "neon_walredo_inmem",
+#endif
 	.smgr_init = inmem_init,
 	.smgr_shutdown = NULL,
 	.smgr_open = inmem_open,
@@ -392,11 +426,32 @@ static const struct f_smgr inmem_smgr =
 	.smgr_registersync = inmem_registersync,
 #endif
 
+#if PG_MAJORVERSION_NUM >= 18
+	.smgr_maxcombine = inmem_maxcombine,
+	.smgr_startreadv = inmem_startreadv,
+	.smgr_fd = inmem_fd,
+	.smgr_owns = inmem_owns,
+#else
 	.smgr_start_unlogged_build = NULL,
 	.smgr_finish_unlogged_build_phase_1 = NULL,
 	.smgr_end_unlogged_build = NULL,
 	.smgr_read_slru_segment = NULL,
+#endif
 };
+
+#if PG_MAJORVERSION_NUM >= 18
+void
+inmem_smgr_register(void)
+{
+	smgrregister(&inmem_smgr);
+}
+
+void
+inmem_smgr_reset(void)
+{
+	inmem_init();
+}
+#else
 
 const f_smgr *
 smgr_inmem(ProcNumber backend, NRelFileInfo rinfo)
@@ -414,3 +469,4 @@ smgr_init_inmem()
 {
 	inmem_init();
 }
+#endif

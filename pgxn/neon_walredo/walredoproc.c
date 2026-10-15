@@ -113,6 +113,9 @@
 #include "storage/procsignal.h"
 #include "storage/sinvaladt.h"
 #include "storage/smgr.h"
+#if PG_MAJORVERSION_NUM >= 18
+#include "storage/aio_subsys.h"
+#endif
 #include "storage/spin.h"
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
@@ -266,11 +269,23 @@ WalRedoMain(int argc, char *argv[])
 	num_temp_buffers = 4;
 	NBuffers = 4;
 
+#if PG_MAJORVERSION_NUM >= 18
+	/*
+	 * There are no IO workers in walredo, and the in-memory smgr completes
+	 * all reads synchronously anyway.
+	 */
+	SetConfigOption("io_method", "sync", PGC_POSTMASTER, PGC_S_OVERRIDE);
+#endif
+
 	/*
 	 * install the simple in-memory smgr
 	 */
+#if PG_MAJORVERSION_NUM >= 18
+	inmem_smgr_register();
+#else
 	smgr_hook = smgr_inmem;
 	smgr_init_hook = smgr_init_inmem;
+#endif
 
 #if PG_VERSION_NUM >= 160000
 	/* make rmgr registry believe we can register the resource manager */
@@ -314,6 +329,10 @@ WalRedoMain(int argc, char *argv[])
 	 * this before we can use LWLocks.
 	 */
 	InitAuxiliaryProcess();
+#if PG_MAJORVERSION_NUM >= 18
+	pgaio_init_backend();
+	smgrinit();
+#endif
 
 	SetProcessingMode(NormalProcessing);
 
@@ -531,6 +550,12 @@ CreateFakeSharedMemoryAndSemaphores(void)
 	CommitTsShmemInit();
 	SUBTRANSShmemInit();
 	MultiXactShmemInit();
+#if PG_MAJORVERSION_NUM >= 18
+	/* PG18 renamed the *ShmemInit functions */
+	BufferManagerShmemInit();
+	LockManagerShmemInit();
+	PredicateLockShmemInit();
+#else
 	InitBufferPool();
 
 	/*
@@ -542,21 +567,31 @@ CreateFakeSharedMemoryAndSemaphores(void)
 	 * Set up predicate lock manager
 	 */
 	InitPredicateLocks();
+#endif
 
 	/*
 	 * Set up process table
 	 */
 	if (!IsUnderPostmaster)
 		InitProcGlobal();
+#if PG_MAJORVERSION_NUM >= 18
+	ProcArrayShmemInit();
+	BackendStatusShmemInit();
+#else
 	CreateSharedProcArray();
 	CreateSharedBackendStatus();
+#endif
 	TwoPhaseShmemInit();
 	BackgroundWorkerShmemInit();
 
 	/*
 	 * Set up shared-inval messaging
 	 */
+#if PG_MAJORVERSION_NUM >= 18
+	SharedInvalShmemInit();
+#else
 	CreateSharedInvalidationState();
+#endif
 
 	/*
 	 * Set up interprocess signaling mechanisms
@@ -583,6 +618,10 @@ CreateFakeSharedMemoryAndSemaphores(void)
 	SyncScanShmemInit();
 	/* Skip due to the 'pg_notify' directory check */
 	/* AsyncShmemInit(); */
+#if PG_MAJORVERSION_NUM >= 18
+	/* buffer reads go through AIO handles in PG18 */
+	AioShmemInit();
+#endif
 
 #ifdef EXEC_BACKEND
 
@@ -830,7 +869,15 @@ ApplyRecord(StringInfo input_message)
 	 */
 	lsn = pq_getmsgint64(input_message);
 
+#if PG_MAJORVERSION_NUM >= 18
+	/*
+	 * PG18's smgrinit() registers an on_proc_exit callback on every call, so
+	 * reset only the in-memory smgr here.
+	 */
+	inmem_smgr_reset();
+#else
 	smgrinit();					/* reset inmem smgr state */
+#endif
 
 	/* note: the input must be aligned here */
 	record = (XLogRecord *) pq_getmsgbytes(input_message, sizeof(XLogRecord));

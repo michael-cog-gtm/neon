@@ -6,6 +6,7 @@
 #include "access/xlog_internal.h"
 #include "nodes/replnodes.h"
 #include "replication/walreceiver.h"
+#include "storage/latch.h"
 #include "utils/uuid.h"
 
 #include "libpqwalproposer.h"

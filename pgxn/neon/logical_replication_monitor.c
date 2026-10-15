@@ -10,6 +10,7 @@
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "replication/slot.h"
+#include "storage/latch.h"
 #include "storage/fd.h"
 #include "storage/procsignal.h"
 #include "tcop/tcopprot.h"

@@ -56,6 +56,7 @@
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
+#include "storage/fd.h"
 #include "storage/fsm_internals.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
@@ -1042,7 +1043,7 @@ neon_zeroextend(SMgrRelation reln, ForkNumber forkNum, BlockNumber blocknum,
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg(NEON_TAG "cannot extend file \"%s\" beyond %u blocks",
-						relpath(reln->smgr_rlocator, forkNum),
+						neon_relpath(reln->smgr_rlocator, forkNum),
 						InvalidBlockNumber)));
 
 	if (debug_compare_local)
@@ -2128,7 +2129,7 @@ neon_end_unlogged_build(SMgrRelation reln)
 #define STRPREFIX(str, prefix) (strncmp(str, prefix, strlen(prefix)) == 0)
 
 static int
-neon_read_slru_segment(SMgrRelation reln, const char* path, int segno, void* buffer)
+neon_read_slru_segment_internal(const char *path, int64 segno, void *buffer)
 {
 	XLogRecPtr	request_lsn,
 				not_modified_since;
@@ -2182,6 +2183,62 @@ neon_read_slru_segment(SMgrRelation reln, const char* path, int segno, void* buf
 	return n_blocks;
 }
 
+#if PG_MAJORVERSION_NUM >= 18
+/*
+ * PG18: the SLRU download hook is no longer an smgr method, and it is
+ * responsible for writing the downloaded segment to the local file itself.
+ */
+static bool
+neon_read_slru_segment(const char *path, int64 segno)
+{
+	char	   *buffer;
+	int			n_blocks;
+	int			fd;
+
+	buffer = palloc(BLCKSZ * SLRU_PAGES_PER_SEGMENT);
+	n_blocks = neon_read_slru_segment_internal(path, segno, buffer);
+	if (n_blocks <= 0)
+	{
+		pfree(buffer);
+		return false;
+	}
+
+	fd = OpenTransientFile(path, O_RDWR | O_CREAT | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg(NEON_TAG "could not create file \"%s\": %m", path)));
+
+	errno = 0;
+	pgstat_report_wait_start(WAIT_EVENT_SLRU_WRITE);
+	if (pg_pwrite(fd, buffer, n_blocks * BLCKSZ, 0) != n_blocks * BLCKSZ)
+	{
+		pgstat_report_wait_end();
+		/* if write didn't set errno, assume problem is no disk space */
+		if (errno == 0)
+			errno = ENOSPC;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg(NEON_TAG "could not write file \"%s\": %m", path)));
+	}
+	pgstat_report_wait_end();
+
+	if (CloseTransientFile(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg(NEON_TAG "could not close file \"%s\": %m", path)));
+
+	pfree(buffer);
+	return true;
+}
+#else
+static int
+neon_read_slru_segment(SMgrRelation reln, const char *path, int segno, void *buffer)
+{
+	return neon_read_slru_segment_internal(path, segno, buffer);
+}
+#endif
+
 static void
 AtEOXact_neon(XactEvent event, void *arg)
 {
@@ -2217,9 +2274,87 @@ AtEOXact_neon(XactEvent event, void *arg)
 	communicator_reconfigure_timeout_if_needed();
 }
 
+#if PG_MAJORVERSION_NUM >= 18
+/*
+ * Relations whose storage lives in local files (temp, unlogged, and
+ * permanent relations during phase 1 of an unlogged build) are served by md.c.
+ */
+static bool
+neon_rel_is_local(SMgrRelation reln)
+{
+	switch (reln->smgr_relpersistence)
+	{
+		case RELPERSISTENCE_PERMANENT:
+			return RelFileInfoEquals(unlogged_build_rel_info, InfoFromSMgrRel(reln));
+		case RELPERSISTENCE_TEMP:
+		case RELPERSISTENCE_UNLOGGED:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static uint32
+neon_maxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
+{
+	if (neon_rel_is_local(reln))
+		return mdmaxcombine(reln, forknum, blocknum);
+
+	return PG_IOV_MAX;
+}
+
+static void
+neon_startreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
+				BlockNumber blocknum, void **buffers, BlockNumber nblocks)
+{
+	if (neon_rel_is_local(reln))
+	{
+		mdstartreadv(ioh, reln, forknum, blocknum, buffers, nblocks);
+		return;
+	}
+
+	/*
+	 * Pages served by the pageserver are read synchronously (the prefetch
+	 * machinery still pipelines requests issued through smgrprefetch()), and
+	 * the AIO handle is completed immediately.
+	 */
+	neon_readv(reln, forknum, blocknum, buffers, nblocks);
+	neon_aio_complete_readv_synchronously(ioh, reln, forknum, blocknum,
+										  buffers, nblocks);
+}
+
+static int
+neon_fd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
+{
+	/* Only reached for IOs staged through mdstartreadv(), i.e. local files */
+	return mdfd(reln, forknum, blocknum, off);
+}
+
+static bool
+neon_owns(RelFileLocator rlocator, ProcNumber backend, char relpersistence)
+{
+	/* Don't use page server for temp relations */
+	return backend == INVALID_PROC_NUMBER;
+}
+
+static void
+neon_smgr_init(void)
+{
+	RegisterXactCallback(AtEOXact_neon, NULL);
+
+	neon_init();
+	communicator_init();
+}
+#endif
+
 static const struct f_smgr neon_smgr =
 {
+#if PG_MAJORVERSION_NUM >= 18
+	.smgr_name = "neon",
+	.smgr_init = neon_smgr_init,
+#else
 	.smgr_init = neon_init,
+#endif
 	.smgr_shutdown = NULL,
 	.smgr_open = neon_open,
 	.smgr_close = neon_close,
@@ -2247,12 +2382,56 @@ static const struct f_smgr neon_smgr =
 #if PG_MAJORVERSION_NUM >= 17
 	.smgr_registersync = neon_registersync,
 #endif
+#if PG_MAJORVERSION_NUM >= 18
+	.smgr_maxcombine = neon_maxcombine,
+	.smgr_startreadv = neon_startreadv,
+	.smgr_fd = neon_fd,
+	.smgr_owns = neon_owns,
+#else
 	.smgr_start_unlogged_build = neon_start_unlogged_build,
 	.smgr_finish_unlogged_build_phase_1 = neon_finish_unlogged_build_phase_1,
 	.smgr_end_unlogged_build = neon_end_unlogged_build,
 
 	.smgr_read_slru_segment = neon_read_slru_segment,
+#endif
 };
+
+#if PG_MAJORVERSION_NUM >= 18
+/*
+ * Thin wrappers for the global unlogged-build hooks: in PG18 these are called
+ * for every relation, including temp relations owned by md.c.
+ */
+static void
+neon_start_unlogged_build_hook(SMgrRelation reln)
+{
+	if (reln->smgr_rlocator.backend == INVALID_PROC_NUMBER)
+		neon_start_unlogged_build(reln);
+}
+
+static void
+neon_finish_unlogged_build_phase_1_hook(SMgrRelation reln)
+{
+	if (reln->smgr_rlocator.backend == INVALID_PROC_NUMBER)
+		neon_finish_unlogged_build_phase_1(reln);
+}
+
+static void
+neon_end_unlogged_build_hook(SMgrRelation reln)
+{
+	if (reln->smgr_rlocator.backend == INVALID_PROC_NUMBER)
+		neon_end_unlogged_build(reln);
+}
+
+void
+neon_smgr_register(void)
+{
+	smgrregister(&neon_smgr);
+	start_unlogged_build_hook = neon_start_unlogged_build_hook;
+	finish_unlogged_build_phase_1_hook = neon_finish_unlogged_build_phase_1_hook;
+	end_unlogged_build_hook = neon_end_unlogged_build_hook;
+	read_slru_segment_hook = neon_read_slru_segment;
+}
+#else
 
 const f_smgr *
 smgr_neon(ProcNumber backend, NRelFileInfo rinfo)
@@ -2274,6 +2453,7 @@ smgr_init_neon(void)
 	neon_init();
 	communicator_init();
 }
+#endif
 
 
 static void
