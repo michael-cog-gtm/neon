@@ -96,12 +96,18 @@ impl Conf {
             "Running initdb in {:?} with user \"postgres\"",
             self.datadir
         );
-        let output = self
-            .new_pg_command("initdb")?
-            .arg("--pgdata")
-            .arg(&self.datadir)
-            .args(["--username", "postgres", "--no-instructions", "--no-sync"])
-            .output()?;
+        let mut initdb = self.new_pg_command("initdb")?;
+        initdb.arg("--pgdata").arg(&self.datadir).args([
+            "--username",
+            "postgres",
+            "--no-instructions",
+            "--no-sync",
+        ]);
+        // Match the data_checksums=off clusters Neon creates; PG18 enables checksums by default.
+        if self.pg_version >= PgMajorVersion::PG18 {
+            initdb.arg("--no-data-checksums");
+        }
+        let output = initdb.output()?;
         debug!("initdb output: {:?}", output);
         ensure!(
             output.status.success(),
