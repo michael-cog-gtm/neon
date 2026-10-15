@@ -35,7 +35,7 @@ pub fn get_lsn_from_controlfile(path: &Utf8Path) -> Result<Lsn> {
     let controlfile_path = path.join("global").join("pg_control");
     let controlfile_buf = std::fs::read(&controlfile_path)
         .with_context(|| format!("reading controlfile: {controlfile_path}"))?;
-    let controlfile = ControlFileData::decode(&controlfile_buf)?;
+    let controlfile = postgres_ffi::decode_pg_control(&controlfile_buf)?;
     let lsn = controlfile.checkPoint;
 
     Ok(Lsn(lsn))
@@ -528,7 +528,7 @@ async fn import_file(
                 let bytes = read_all_bytes(reader).await?;
 
                 // Extract the checkpoint record and import it separately.
-                let pg_control = ControlFileData::decode(&bytes[..])?;
+                let pg_control = postgres_ffi::decode_pg_control(&bytes[..])?;
                 let checkpoint_bytes = pg_control.checkPointCopy.encode()?;
                 modification.put_checkpoint(checkpoint_bytes)?;
                 debug!("imported control file");

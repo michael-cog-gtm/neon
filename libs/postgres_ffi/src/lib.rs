@@ -274,6 +274,25 @@ pub fn generate_wal_segment(
     )
 }
 
+/// Decodes a `pg_control` file of any supported version into the version-independent
+/// [`ControlFileData`] (the v14 layout). The fields Neon reads from it are laid out the same in
+/// all supported versions, but PG18 added `default_char_signedness`, which moves `crc`, so the
+/// CRC is verified using the layout that matches the file's `pg_control_version`.
+pub fn decode_pg_control(buf: &[u8]) -> anyhow::Result<ControlFileData> {
+    use utils::bin_ser::LeSer;
+    const PG18_CONTROL_VERSION: u32 = 1800;
+
+    let version_bytes = buf
+        .get(8..12)
+        .ok_or_else(|| anyhow::anyhow!("control file is too short"))?;
+    let pg_control_version = u32::from_le_bytes(version_bytes.try_into()?);
+    if pg_control_version < PG18_CONTROL_VERSION {
+        return ControlFileData::decode(buf);
+    }
+    v18::bindings::ControlFileData::decode(buf)?;
+    Ok(ControlFileData::des_prefix(buf)?)
+}
+
 pub fn generate_pg_control(
     pg_control_bytes: &[u8],
     checkpoint_bytes: &[u8],

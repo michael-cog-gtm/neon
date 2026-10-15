@@ -48,6 +48,17 @@ buffer-completion callbacks registered). Neon has no local fd for pageserver-bac
 - Last-written-LSN cache: the PG18 fork dropped the block-level `set_lwlsn_block*` hooks and the `LastWrittenLsn` core
   LWLock; neon allocates its own `neon_lwlsn` tranche and only installs the db/relation/max hooks.
 
+### WAL / on-disk formats
+- `XLOG_PAGE_MAGIC` 0xD118, `PG_CONTROL_VERSION` 1800, `CATALOG_VERSION_NO` 202506291 (picked up from bindings;
+  catversion added to import_pgdata's version detection).
+- `ControlFileData` gained `default_char_signedness` right before `crc`. Neon used the v14 `ControlFileData` re-export
+  version-agnostically when importing a fresh initdb datadir, so PG18 `tenant create` failed with
+  `invalid CRC in control file`. Added `postgres_ffi::decode_pg_control()`, which verifies the CRC with the file's own
+  layout (by `pg_control_version`) and returns the shared-prefix fields; used by `import_datadir` and `import_pgdata`.
+- `xl_heap_inplace` now carries invalidation messages; neon only needs its block reference, so no decoder change.
+- Heap/neon-rmgr/dbase/XLOG_PARAMETER_CHANGE/END_OF_RECOVERY record layouts are unchanged vs PG17; the v17 decoders are
+  reused for PG18.
+
 ### Rust
 - `PgMajorVersion::PG18`, `PgVersionId` range, `for_all_postgres_versions!`/dispatch macros, bindgen for v18.
 
